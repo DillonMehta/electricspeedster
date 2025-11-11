@@ -119,31 +119,41 @@ void setup()
   calculateTotalFwd(movement);
   delayer_amt = (time_diff * 1000) / (total_turns + total_fwd);
   calculateTotalDistance(movement);
-  const uint8_t DN1_PIN = 1;  
+  const uint8_t DN1_PIN = A11;  
   pinMode(DN1_PIN, INPUT);
   buzzer.playFrequency(880, 120, 15);
-    while (true)
+
+
+  bool armed = false;
+
+  while (!armed)
   {
     int s = digitalRead(DN1_PIN);
 
-    if (s == HIGH)
+    if (s == LOW)
     {
       if (tHighStart == 0) tHighStart = millis();
-      // confirm it's stayed high long enough
+
+      // if it’s been high long enough, mark ready
       if (millis() - tHighStart >= holdRequiredMs)
       {
-        // now require a LOW (release) before we start moving
-        // (prevents immediate start while you're still holding the trigger)
-        while (digitalRead(DN1_PIN) == HIGH) { delay(1); }
-        delay(debounceMs); // simple debounce on release
-        break; // armed & released -> go
+        armed = true;
+
+        // play "ready to release" tone
+        buzzer.playFrequency(1200, 200, 15);
+        buzzer.playFrequency(1600, 200, 15);
+
+        // wait until the trigger goes LOW to actually start moving
+        while (digitalRead(DN1_PIN) == LOW) { delay(1); }
+        delay(debounceMs);
       }
     }
     else
     {
-      tHighStart = 0; // reset if it ever drops before 3s
+      tHighStart = 0;
     }
-    delay(debounceMs); // light debounce/polling interval
+
+    delay(debounceMs);
   }
 
   buzzer.playFrequency(440, 200, 15);
