@@ -66,7 +66,7 @@ Most improvements come from **reducing variance**, not increasing speed.
 
 ## Attribution
 
-This project is adapted from control logic originally developed by **Dillon Mehta** and **Jay Sahni** for the 2024 Science Olympiad **Robot Tour** event, which placed **2nd overall** at a national-level invitational. The root code can be found in the following repo: [https://github.com/DillonMehta/autonomusPathfindingBot](url)
+This project is adapted from control logic originally developed by **Dillon Mehta** and **Jay Sahni** for the 2024 Science Olympiad **Robot Tour** event, which placed **2nd overall** at a national-level invitational. The root code can be found in the following repo: [https://github.com/DillonMehta/autonomusPathfindingBot](https://github.com/DillonMehta/autonomusPathfindingBot)
 
 The code was subsequently **reworked, extended, and adapted by Dillon Mehta** for use in his **2025–2026 Science Olympiad Electric Vehicle**, which he currently competes with. Modifications reflect the Electric Vehicle event’s distinct constraints, scoring mechanics, and emphasis on braking precision and distance repeatability.
 
