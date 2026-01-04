@@ -1,4 +1,5 @@
-# Science Olympiad Electric Vehicle (2025–2026)
+# Electric Speedester Jordan High School
+Science Olympiad Electric Vehicle (2025–2026)
 
 This repository contains the control code and supporting utilities for a **Science Olympiad Electric Vehicle** designed for precision distance travel, repeatability, and rule-compliant autonomy.
 
