@@ -1,0 +1,12 @@
+# Large artifacts / data — kept out of git (regenerate locally)
+cuebench_model/
+cuebench_sanity/
+data/
+swechat_rich.json
+judgments.json
+
+# Logs & caches
+*.log
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
