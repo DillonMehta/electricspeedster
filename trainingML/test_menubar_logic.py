@@ -174,6 +174,41 @@ def test_latest_session_path_skips_agents(tmp_path):
     assert m.latest_session_path(str(tmp_path / "empty")) is None
 
 
+def test_env_truthy():
+    assert m._env_truthy("1") and m._env_truthy("true") and m._env_truthy("ON")
+    assert not m._env_truthy("") and not m._env_truthy("0") and not m._env_truthy(None)
+
+
+def test_trace_is_a_managed_toggle():
+    assert "CUEBENCH_TRACE" in d.MANAGED_ENV_KEYS                     # editable in Settings
+    assert ("CUEBENCH_TRACE", "Session trace", "toggle") in m.SETTINGS_FIELDS
+
+
+def test_mask_key():
+    assert m._mask_key("") == "(none set)"
+    assert m._mask_key("sk-ant-abcdefghijklmnop") == "sk-ant…mnop"   # masked middle
+    assert "…" in m._mask_key("short")
+
+
+def test_diagnose_post_status_mapping():
+    assert m._diagnose_post("u", "k", 200, '{"ok":true}', None).startswith("✓")
+    assert "401" in m._diagnose_post("u", "k", 401, "Invalid x-api-key", None)
+    assert "no API key" in m._diagnose_post("u", "", 401, "x-api-key header required", None)
+    assert "employeeId" in m._diagnose_post("u", "k", 404, "Employee not found", None)
+    assert "400" in m._diagnose_post("u", "k", 400, "employeeId required", None)
+    assert "Cloudflare" in m._diagnose_post("u", "k", 403, "error code: 1010", None)  # UA ban
+    assert "permission" in m._diagnose_post("u", "k", 403, "Forbidden", None).lower()  # generic 403
+    assert m._diagnose_post("u", "k", None, None, "Connection refused").startswith("✗")
+
+
+def test_debug_test_post_no_url(tmp_path, monkeypatch):
+    monkeypatch.setattr(d, "ENVFILE", str(tmp_path / "none.env"))   # no daemon.env -> no URL
+    monkeypatch.delenv("CUEBENCH_API_URL", raising=False)
+    report = m.debug_test_post()
+    assert "CUEBENCH_API_URL is not set" in report                  # never throws; reports clearly
+    assert "request body" in report and "employeeId" in report      # shows what it would send
+
+
 def test_build_app_bundle(tmp_path):
     app = m.build_app_bundle(str(tmp_path))
     import os

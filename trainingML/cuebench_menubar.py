@@ -40,14 +40,19 @@ ICON_PATH = os.path.join(_HERE, "cuebench_icon.png")   # menu bar template (CueB
 ICNS_PATH = os.path.join(_HERE, "CueBench.icns")        # .app Finder/Dock icon
 
 # Settings fields shown in the gear pane: (env key, label, kind)
-#   kind: "text" | "secret" | "choice"
+#   kind: "text" | "secret" | "choice" | "toggle"
 SETTINGS_FIELDS = [
     ("CUEBENCH_EMPLOYEE_ID", "Employee ID", "text"),
     ("CUEBENCH_API_URL",     "Dashboard URL (forward)", "text"),
     ("CUEBENCH_API_KEY",     "Dashboard API key", "secret"),
     ("CUEBENCH_BYOK_KEY",    "BYOK key (generation)", "secret"),
     ("CUEBENCH_BYOK_MODEL",  "BYOK model", "choice"),
+    ("CUEBENCH_TRACE",       "Session trace", "toggle"),
 ]
+
+
+def _env_truthy(v) -> bool:
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
 
 # BYOK model dropdown — (label, value). Empty value = let the engine pick the cheapest
 # default for the provider (anthropic→claude-haiku-4-5, openai→gpt-4o-mini). Generation is
@@ -329,6 +334,97 @@ def generate_payload_preview(session_path: str, out_path: str = PREVIEW_PATH) ->
         return False, out_path
 
 
+# ---- Developer: test POST so you can SEE server errors (401/404/400) -------
+def _mask_key(key: str) -> str:
+    if not key:
+        return "(none set)"
+    return key[:6] + "…" + key[-4:] if len(key) > 12 else key[:2] + "…"
+
+
+def _diagnose_post(url: str, key: str, status, body: str, error: str) -> str:
+    if error:
+        return ("✗ Couldn't reach the server. Check the Dashboard URL "
+                "(https://<org-slug>.cuebench.dev/api/session) and your connection.")
+    b = (body or "").lower()
+    if status in (200, 201):
+        return "✓ Success — the server accepted the test session."
+    if status == 401:
+        return ("✗ 401 Unauthorized — " + ("no API key set; paste your org key in Settings."
+                if not key else "wrong API key. Get it from admin.cuebench.dev → org → API key, "
+                "or manager Settings → Organization → API key."))
+    if status == 404:
+        return ("✗ 404 — employeeId not found. It must match the id in CueBench "
+                "(e.g. emp-firstname-lastname). Verify it in admin → Debug.")
+    if status == 400:
+        return ("✗ 400 Bad Request — usually a missing employeeId or malformed body. "
+                "See the response above for the exact field.")
+    if status == 403:
+        if "1010" in b or "error code" in b or "cloudflare" in b:
+            return ("✗ 403 (Cloudflare error 1010) — the dashboard's Cloudflare blocked the "
+                    "request by browser signature. We now send a real User-Agent; if it still "
+                    "blocks, add a Cloudflare WAF skip/allow rule for /api/session (or disable "
+                    "Browser Integrity Check for the API host) — an API endpoint shouldn't gate "
+                    "programmatic clients.")
+        return ("✗ 403 Forbidden — the API key may lack permission for this org, or the org "
+                "slug in the URL is wrong. Verify both in admin.cuebench.dev.")
+    return f"✗ HTTP {status} — see the response body above."
+
+
+def _format_post_report(url, key, payload, status, body, error) -> str:
+    return "\n".join([
+        "CueBench — debug: test POST",
+        "=" * 46,
+        f"POST {url or '(CUEBENCH_API_URL not set)'}",
+        f"x-api-key : {_mask_key(key)}",
+        f"employeeId: {payload.get('employeeId')!r}",
+        "",
+        "--- request body ---",
+        json.dumps(payload, indent=2),
+        "",
+        "--- response ---",
+        (f"(no response) {error}" if error else f"HTTP {status}\n{body or '(empty body)'}"),
+        "",
+        "--- diagnosis ---",
+        _diagnose_post(url, key, status, body, error),
+        "",
+        "Note: a successful test creates/updates one session 'CueBench connection test' "
+        "(sessionId S-DBGTEST) for that employee — re-running just updates it.",
+    ])
+
+
+def debug_test_post(timeout: int = 20) -> str:
+    """Send a minimal real POST with the CURRENT settings and return a human-readable report
+    of the request + response (or error). Lets you see 401/404/400 right after pasting config."""
+    env = {**os.environ, **d.parse_env_file(d.ENVFILE)}
+    url = (env.get("CUEBENCH_API_URL") or "").strip()
+    key = (env.get("CUEBENCH_API_KEY") or "").strip()
+    emp = (env.get("CUEBENCH_EMPLOYEE_ID") or "").strip() or "e1"
+    payload = {
+        "employeeId": emp,
+        "sessionId": "S-DBGTEST",
+        "title": "CueBench connection test",
+        "score": 50,
+        "vectors": {"delegation": 50, "description": 50, "discernment": 50, "diligence": 50},
+    }
+    if not url:
+        return _format_post_report(url, key, payload, None, None,
+                                   "CUEBENCH_API_URL is not set (Settings → Dashboard URL).")
+    from urllib import request as ureq, error as uerr
+    req = ureq.Request(url, data=json.dumps(payload).encode("utf-8"), method="POST",
+                       headers={"Content-Type": "application/json", "x-api-key": key,
+                                "User-Agent": "CueBench-Agent/1.0",   # avoid Cloudflare 1010 UA ban
+                                "Idempotency-Key": payload["sessionId"]})
+    try:
+        with ureq.urlopen(req, timeout=timeout) as resp:
+            body = resp.read(4000).decode("utf-8", "replace")
+            return _format_post_report(url, key, payload, resp.status, body, None)
+    except uerr.HTTPError as e:
+        body = e.read(4000).decode("utf-8", "replace")
+        return _format_post_report(url, key, payload, e.code, body, None)
+    except Exception as e:
+        return _format_post_report(url, key, payload, None, None, repr(e))
+
+
 # ---- GUI auto-start (login item) ------------------------------------------
 MENUBAR_OUT_LOG = os.path.join(d.LOG_DIR, "cuebench-menubar.out.log")
 MENUBAR_ERR_LOG = os.path.join(d.LOG_DIR, "cuebench-menubar.err.log")
@@ -489,6 +585,13 @@ def build_settings_window(cur, target=None,
                     pop.selectItemWithTitle_(ctitle)
             content.addSubview_(pop)
             fields[key] = pop
+        elif kind == "toggle":
+            cb = NSButton.alloc().initWithFrame_(NSMakeRect(FIELD_X, y - 2, FIELD_W, 22))
+            cb.setButtonType_(3)                    # NSSwitchButton (a checkbox)
+            cb.setTitle_("Generate timeline trace (needs a BYOK key)")
+            cb.setState_(1 if _env_truthy(cur.get(key, "")) else 0)
+            content.addSubview_(cb)
+            fields[key] = cb
         else:
             cls = NSSecureTextField if kind == "secret" else NSTextField
             fld = cls.alloc().initWithFrame_(NSMakeRect(FIELD_X, y, FIELD_W, FIELD_H))
@@ -752,6 +855,9 @@ def run_menubar():
             self._sep()
             self._add("", enabled=False, attr=self._attr("DEVELOPER", size=10, color=ter, kern=0.5))
             self._add("Preview payload JSON (what gets sent)…", "doPreviewPayload:", indent=1)
+            self._add("Test POST to dashboard (debug)…", "doDebugPost:", indent=1)
+            self._add("Clear sent cache (resend sessions)…", "doClearCache:", indent=1)
+            self._add("Regenerate insights + trace (resend)…", "doRegenerate:", indent=1)
             self._add("Open config file…", "doOpenConfig:", indent=1)
 
             self._sep()
@@ -888,7 +994,8 @@ def run_menubar():
             print(f"[menubar] preview requested for {path}", flush=True)
             # Open a native read-only viewer immediately (no Xcode, no external app); it shows
             # a placeholder, then fills in when the dry-run scoring finishes (~15s).
-            self._open_preview_viewer(
+            self._open_text_viewer(
+                "CueBench — payload that gets sent (dry-run)",
                 "Generating payload preview…\n\n"
                 "Scoring your most recent session in DRY-RUN — nothing is sent.\n"
                 "Loading the model takes ~15s; the exact JSON will appear here.")
@@ -896,7 +1003,7 @@ def run_menubar():
             threading.Thread(target=self._gen_preview, args=(path,), daemon=True).start()
 
         @objc.python_method
-        def _open_preview_viewer(self, text):
+        def _open_text_viewer(self, title, text):
             from AppKit import (NSWindow, NSScrollView, NSTextView, NSFont,
                                 NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
                                 NSWindowStyleMaskResizable, NSBackingStoreBuffered,
@@ -906,7 +1013,7 @@ def run_menubar():
                 rect,
                 NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
                 NSBackingStoreBuffered, False)
-            win.setTitle_("CueBench — payload that gets sent (dry-run)")
+            win.setTitle_(title)
             win.setReleasedWhenClosed_(False)
             scroll = NSScrollView.alloc().initWithFrame_(rect)
             scroll.setHasVerticalScroller_(True)
@@ -945,6 +1052,97 @@ def run_menubar():
             if getattr(self, "_preview_tv", None) is not None:
                 self._preview_tv.setString_(text)
 
+        def doDebugPost_(self, _s):
+            # Send a real test POST with the CURRENT Settings (URL + API key + employeeId) and
+            # show the full request/response so you can see 401/404/400 errors right away.
+            self._open_text_viewer(
+                "CueBench — debug: test POST",
+                "Sending a test session to your configured dashboard URL…\n"
+                "(uses the URL, API key and Employee ID from Settings)")
+            import threading
+            threading.Thread(target=self._run_debug_post, daemon=True).start()
+
+        @objc.python_method
+        def _run_debug_post(self):
+            try:
+                report = debug_test_post()
+            except Exception as e:
+                report = f"debug test failed: {e!r}"
+            print("[menubar] debug test POST run", flush=True)
+            AppHelper.callAfter(self._fill_preview, report)
+
+        def doClearCache_(self, _s):
+            a = NSAlert.alloc().init()
+            a.setMessageText_("Clear sent cache and resend?")
+            a.setInformativeText_(
+                "Resets the 'already sent' record so the daemon RE-POSTs sessions it previously "
+                "sent. Generated titles/insights are kept (no BYOK re-billing). The daemon "
+                "restarts to rescan. In DRY-RUN nothing leaves your machine; in LIVE mode "
+                "sessions are re-POSTed to the dashboard.")
+            a.addButtonWithTitle_("Clear & Resend")
+            a.addButtonWithTitle_("Cancel")
+            if a.runModal() != 1000:                  # not the first button
+                return
+            try:
+                res = d.clear_sent_cache()
+            except Exception as e:
+                self._alert("Clear cache failed", repr(e))
+                return
+            restarted = False
+            if d.status_dict().get("loaded"):
+                svc = self._svc()
+                try:
+                    svc.restart()
+                    restarted = True
+                except Exception:
+                    pass
+            print(f"[menubar] cleared sent cache: {res}", flush=True)
+            self.rebuild()
+            bak = f"\nBacked up {os.path.basename(res['scored_backup'])}." if res.get("scored_backup") else ""
+            self._alert(
+                "Sent cache cleared",
+                f"Reset {res['cleared']} sent record(s). "
+                + ("The daemon restarted — it will rescan and resend on the next poll."
+                   if restarted else "Start the daemon to rescan and resend.") + bak)
+
+        def doRegenerate_(self, _s):
+            has_trace = _env_truthy(d.parse_env_file(d.ENVFILE).get("CUEBENCH_TRACE"))
+            a = NSAlert.alloc().init()
+            a.setMessageText_("Regenerate insights + trace, then resend?")
+            a.setInformativeText_(
+                "Wipes the cached generation so EVERY session re-runs your BYOK model "
+                "(this spends BYOK tokens) and re-POSTs. Use this to add the session trace "
+                "to sessions scored before traces were on.\n\n"
+                + ("✓ Session trace is ON." if has_trace else
+                   "⚠️ Session trace is currently OFF — turn it on in Settings first, or the "
+                   "regenerated sessions still won't have a trace.")
+                + " Needs a BYOK key set.")
+            a.addButtonWithTitle_("Regenerate & Resend")
+            a.addButtonWithTitle_("Cancel")
+            if a.runModal() != 1000:
+                return
+            try:
+                res = d.clear_sent_cache(wipe_generation=True)
+            except Exception as e:
+                self._alert("Regenerate failed", repr(e))
+                return
+            restarted = False
+            if d.status_dict().get("loaded"):
+                svc = self._svc()
+                try:
+                    svc.restart()
+                    restarted = True
+                except Exception:
+                    pass
+            print(f"[menubar] regenerate (wipe gen) -> {res}", flush=True)
+            self.rebuild()
+            self._alert(
+                "Regeneration queued",
+                f"Cleared generation + {res['cleared']} sent record(s). "
+                + ("The daemon restarted — it will re-score, regenerate, and resend."
+                   if restarted else "Start the daemon to regenerate and resend.")
+                + ("" if has_trace else "\n\nReminder: traces need the Settings → Session trace toggle ON."))
+
         def doQuit_(self, _s):
             NSApp.terminate_(self)
 
@@ -966,9 +1164,12 @@ def run_menubar():
         def doSaveSettings_(self, _s):
             updates = {}
             for k in self.fields:
-                if self.field_kinds.get(k) == "choice":
+                kind = self.field_kinds.get(k)
+                if kind == "choice":
                     title = self.fields[k].titleOfSelectedItem()
                     updates[k] = self.model_value_by_title.get(title, "")
+                elif kind == "toggle":
+                    updates[k] = "1" if self.fields[k].state() else ""   # checkbox -> env flag
                 else:
                     updates[k] = self.fields[k].stringValue()
             try:
@@ -1014,6 +1215,20 @@ def main(argv=None):
         import json
         print(json.dumps(d.status_dict(), indent=2, default=str))
         print("recent:", json.dumps(recent_sessions(6), indent=2))
+        return 0
+    if argv and argv[0] in ("--restart", "--start"):
+        # Always works whether or not the agent is currently loaded (kickstart only works on a
+        # loaded service). Rewrites the login plist and (re)bootstraps it in the GUI domain.
+        enable_gui_login()
+        running = bool(__import__("subprocess").run(
+            ["pgrep", "-f", "cuebench_menubar.py"], capture_output=True).returncode == 0)
+        print("CueBench menu bar app (re)started." if running else
+              "Bootstrapped the menu bar agent (give it a second to appear).")
+        return 0
+    if argv and argv[0] in ("--quit", "--stop"):
+        disable_gui_login()                      # boot out + remove the login plist
+        subprocess.run(["pkill", "-9", "-f", "cuebench_menubar.py"], capture_output=True)
+        print("CueBench menu bar app stopped (re-run with --restart to bring it back).")
         return 0
     run_menubar()
     return 0

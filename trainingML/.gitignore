@@ -1,0 +1,27 @@
+# Large artifacts / data — kept out of git (regenerate locally)
+cuebench_model/
+cuebench_sanity/
+data/
+swechat_rich.json
+judgments.json
+
+# Runtime state
+scored_sessions.json
+scored_sessions.json.bak
+cuebench_state.db
+cuebench_state.db-*
+
+# Raw Claude Code session transcripts — contain prompts/code; NEVER commit
+*.jsonl
+
+# Build artifacts (regenerate: python cuebench_menubar.py --build-app / make_icon.py)
+CueBench.app/
+CueBench.iconset/
+
+# Logs & caches
+*.log
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+.ipynb_checkpoints/
