@@ -70,7 +70,8 @@ ERR_LOG      = os.path.join(LOG_DIR, "cuebench-daemon.err.log")
 DEFAULT_STATE_DB    = os.path.join(APP_DIR, "cuebench_state.db")
 DEFAULT_MODEL_DIR   = os.path.join(APP_DIR, "cuebench_model")
 DEFAULT_SCORED_FILE = os.path.join(APP_DIR, "scored_sessions.json")
-DEFAULT_PROJECTS    = os.path.join(HOME, ".claude", "projects")
+DEFAULT_PROJECTS    = os.path.join(HOME, ".claude", "projects")     # Claude Code transcripts
+DEFAULT_CODEX       = os.path.join(HOME, ".codex", "sessions")       # Codex CLI rollouts
 
 # launchd agents start with a near-empty PATH; git_signals shells out to `git`, so put git's
 # dir (and the interpreter's) on PATH explicitly.
@@ -286,6 +287,7 @@ def cmd_run(args) -> int:
     os.environ.setdefault("CUEBENCH_MODEL_DIR", DEFAULT_MODEL_DIR)
     os.environ.setdefault("CUEBENCH_SCORED_FILE", DEFAULT_SCORED_FILE)
     os.environ.setdefault("CUEBENCH_PROJECTS_DIR", DEFAULT_PROJECTS)
+    os.environ.setdefault("CUEBENCH_CODEX_DIR", DEFAULT_CODEX)
 
     live = bool(args.live) or _truthy(os.environ.get("CUEBENCH_DAEMON_LIVE"))
     dry_run = not live
@@ -321,9 +323,15 @@ def cmd_run(args) -> int:
     import cuebench_agent as agent
 
     projects = os.environ["CUEBENCH_PROJECTS_DIR"]
+    codex = os.environ.get("CUEBENCH_CODEX_DIR", "")
+    roots = [projects] + ([codex] if codex and os.path.isdir(codex) else [])
+    watching = "; ".join(roots)
     print(f"[daemon] starting  mode={mode}  pid={os.getpid()}  "
           f"time={time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
-    print(f"[daemon] watching  {projects}  (READ-ONLY)", flush=True)
+    print(f"[daemon] watching  {watching}  (READ-ONLY)", flush=True)
+    if codex and not os.path.isdir(codex):
+        print(f"[daemon] (codex dir {codex} not present yet — will pick it up if created "
+              "after restart)", flush=True)
     print(f"[daemon] state_db  {os.environ['CUEBENCH_STATE_DB']}", flush=True)
     print(f"[daemon] model_dir {os.environ['CUEBENCH_MODEL_DIR']}", flush=True)
     print(f"[daemon] poll={agent.POLL_INTERVAL}s stable={agent.STABLE_SECONDS}s "
@@ -361,12 +369,12 @@ def cmd_run(args) -> int:
 
     def _heartbeat():
         state["cycles"] += 1
-        write_status(mode, state["cycles"], agent.POLL_INTERVAL, projects, processed=0)
+        write_status(mode, state["cycles"], agent.POLL_INTERVAL, watching, processed=0)
 
-    write_status(mode, 0, agent.POLL_INTERVAL, projects, processed=0)
+    write_status(mode, 0, agent.POLL_INTERVAL, watching, processed=0)
     # Reuse the EXACT existing loop (stable-size detection, dedup, retry-later) — only the
-    # dry_run flag and the heartbeat hook are added.
-    agent.run_watch_loop(scorer, store, gen, dry_run=dry_run, on_cycle=_heartbeat)
+    # dry_run flag, heartbeat hook, and multi-root (Claude + Codex) scanning are added.
+    agent.run_watch_loop(scorer, store, gen, dry_run=dry_run, on_cycle=_heartbeat, roots=roots)
     return 0   # run_watch_loop loops forever; reached only via SystemExit from the signal handler
 
 

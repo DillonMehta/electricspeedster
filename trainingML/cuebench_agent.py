@@ -476,6 +476,19 @@ def peek_session_uuid(path: str) -> str:
         pass
     return os.path.splitext(os.path.basename(path))[0]
 
+def parse_session(path: str) -> dict:
+    """Provider dispatch: a Codex CLI rollout is parsed by cuebench_codex into the SAME dict
+    shape this module's parse_transcript returns (so Codex sessions score identically); any
+    other JSONL is treated as a Claude Code transcript. Falls back to the Claude parser if the
+    Codex adapter is unavailable for any reason."""
+    try:
+        import cuebench_codex
+        if cuebench_codex.is_codex_rollout(path):
+            return cuebench_codex.parse_codex_transcript(path)
+    except Exception:
+        pass
+    return parse_transcript(path)
+
 def process_one(path: str, scorer: ModelScorer, store: Store, gen: Generator,
                 *, dry_run: bool = False, regenerate: bool = False) -> tuple[str, str | None]:
     """Returns (status, sid). status in {'posted','dup','skip','fail'}:
@@ -486,7 +499,7 @@ def process_one(path: str, scorer: ModelScorer, store: Store, gen: Generator,
     last sent is re-sent as an UPDATE (the dashboard upserts on sessionId); an unchanged
     already-sent session is skipped. A failed POST is NOT marked sent (so it retries) and does
     NOT regenerate (the cached generation is reused)."""
-    parsed = parse_transcript(path)
+    parsed = parse_session(path)      # Claude OR Codex — same dict shape either way
     if not parsed["prompts"]:
         print(f"  [skip] {os.path.basename(path)}: no operator prompts found")
         return "skip", None
@@ -538,7 +551,7 @@ def watch(scorer: ModelScorer, store: Store, gen: Generator):
 
 
 def run_watch_loop(scorer: ModelScorer, store: Store, gen: Generator,
-                   *, dry_run: bool = False, on_cycle=None):
+                   *, dry_run: bool = False, on_cycle=None, roots=None):
     """The poll/stable-size watcher loop — extracted verbatim from watch() so both the
     on-demand entry point and the background daemon share ONE implementation of the
     stable-size detection, poll/stable thresholds, dedup, append-detection and
@@ -549,12 +562,18 @@ def run_watch_loop(scorer: ModelScorer, store: Store, gen: Generator,
       on_cycle -- optional zero-arg callback invoked once per completed scan pass (just
                   before the sleep) so a wrapper can record a liveness heartbeat without
                   duplicating the loop. Exceptions it raises propagate (used for clean
-                  shutdown at a cycle boundary)."""
+                  shutdown at a cycle boundary).
+      roots    -- list of directories to scan for *.jsonl (default [PROJECTS_DIR]). The daemon
+                  passes both ~/.claude/projects AND ~/.codex/sessions so Claude and Codex
+                  sessions are watched together; parse_session dispatches per file."""
+    roots = roots or [PROJECTS_DIR]
     sizes: dict[str, tuple[int, float]] = {}     # path -> (size, first_seen_at_this_size)
     handled: set[str] = set()                    # paths terminal at their current size (this run)
     while True:
         now = time.time()
-        for path in glob.glob(os.path.join(PROJECTS_DIR, "**", "*.jsonl"), recursive=True):
+        scan = [p for root in roots
+                for p in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)]
+        for path in scan:
             name = os.path.basename(path)
             # Subagent transcripts (agent-*.jsonl) are NOT standalone sessions — they share the
             # parent's sessionId. Only score top-level UUID-named session files.
