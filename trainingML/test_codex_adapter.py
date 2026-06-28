@@ -68,6 +68,7 @@ def test_is_codex_rollout(tmp_path):
 def test_parse_codex_maps_to_claude_shape(tmp_path):
     d = cx.parse_codex_transcript(_rollout(tmp_path))
     assert d["session_uuid"] == "abcd1234-0000-1111-2222-333344445555"
+    assert d["cli"] == "codex"                                    # provider tag for the POST
     assert a.make_sid(d["session_uuid"]) == "S-ABCD1234"          # same sid scheme as Claude
     assert d["prompts"] == ["add a debounce to search"]           # injected turn dropped
     assert d["n_tools"] == 4                                      # 3 exec + 1 apply_patch
@@ -80,7 +81,7 @@ def test_parse_codex_maps_to_claude_shape(tmp_path):
     assert d["cwd"] == "/Users/x/proj"
     # exact same keys the Claude parser returns — so everything downstream is identical
     assert set(d.keys()) == {
-        "session_uuid", "prompts", "tool_cmds", "n_tools", "n_edits", "churn", "loops",
+        "session_uuid", "cli", "prompts", "tool_cmds", "n_tools", "n_edits", "churn", "loops",
         "model", "input_tokens", "output_tokens", "first_ts", "last_ts", "duration_s",
         "cwd", "git_branch", "n_lines"}
 

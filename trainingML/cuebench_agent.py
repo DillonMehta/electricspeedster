@@ -191,6 +191,7 @@ def parse_transcript(path: str) -> dict:
 
     return {
         "session_uuid": session_uuid,
+        "cli": "claude code",
         "path": path,
         "prompts": prompts,
         "tool_cmds": tool_cmds,
@@ -461,8 +462,24 @@ def build_payload(parsed: dict, scorer: ModelScorer, store: Store, gen: Generato
         # endpoint; only the short title is kept. insights/trace below stay numbers-only.
         first_prompt = parsed["prompts"][0] if parsed["prompts"] else None
         title = gen.content_title(first_prompt)
-        insights = gen.insights(metrics, vectors, quality)
-        trace = gen.trace(metrics, vectors, quality) if gen.trace_enabled else None
+        # insights are numbers-only UNLESS prompt-informed mode is on (CUEBENCH_INSIGHTS_PROMPTS):
+        # then gen.insights feeds these prompts to its own BYOK endpoint so coaching can
+        # reference what was asked. The flag is checked inside insights(); passing prompts
+        # unconditionally is safe — they're ignored when the opt-in is off.
+        insights = gen.insights(metrics, vectors, quality, prompts=parsed["prompts"])
+        # Content-grounded coaching timeline, built from the ACTUAL transcript events and
+        # generated via the user's own BYOK endpoint (opt-in: double-gated by CUEBENCH_TRACE).
+        trace = None
+        if gen.trace_enabled:
+            timeline = build_timeline(parsed["path"], parsed["first_ts"])
+            header = {
+                "model": parsed["model"] or "unknown", "duration": fmt_mmss(dur),
+                "score": score, "n_prompts": metrics["n_prompts"],
+                "n_tools": metrics["n_tools"], "n_edits": metrics["n_edits"],
+                "loops": metrics["loops"], "n_commits": metrics["n_commits"],
+                "cost_tokens": parsed["input_tokens"] + parsed["output_tokens"],
+            }
+            trace = gen.trace(timeline, header, quality)
         # specificity is the ONE input that sees raw prompt TEXT (opt-in, OpenAI-only). It is
         # sent only to the user's own embeddings endpoint; just the 0-100 NUMBER is kept here.
         specificity = gen.specificity(parsed["prompts"])
@@ -487,6 +504,9 @@ def build_payload(parsed: dict, scorer: ModelScorer, store: Store, gen: Generato
         # generated name, so label by WHEN it ran, not the opaque sessionId).
         "title": title or parsed.get("title_hint") or fmt_date(parsed["last_ts"]),
         "model": parsed["model"] or "unknown",
+        # Which CLI/tool produced the session. Each provider parser stamps it; "ext" is the
+        # fallback for any source that doesn't (an unknown/external transcript).
+        "cli": parsed.get("cli", "ext"),          # "claude code" | "cursor" | "codex" | "ext"
         "date": fmt_date(parsed["last_ts"]),      # v1 schema: human-readable date
         "duration": fmt_duration(dur),
         "score": score,

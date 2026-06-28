@@ -206,6 +206,7 @@ def parse_codex_transcript(path: str) -> dict:
 
     return {
         "session_uuid": session_uuid,
+        "cli": "codex",
         "prompts": prompts,
         "tool_cmds": tool_cmds,
         "n_tools": n_tools,

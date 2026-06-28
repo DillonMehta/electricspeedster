@@ -68,6 +68,7 @@ def test_list_cursor_composers(tmp_path):
 def test_parse_cursor_maps_to_claude_shape(tmp_path):
     d = cur.parse_cursor_composer(CID, _make_db(tmp_path))
     assert d["session_uuid"] == CID
+    assert d["cli"] == "cursor"                    # provider tag for the POST
     assert a.make_sid(CID) == "S-CUR12345"
     assert d["title_hint"] == "Build app"          # composer name → free, accurate title
     assert d["prompts"] == ["do X please"]
@@ -79,9 +80,9 @@ def test_parse_cursor_maps_to_claude_shape(tmp_path):
     assert d["model"] == "composer-2.5"
     assert d["cwd"] == "/Users/x/proj" and d["git_branch"] == "main"
     assert set(d.keys()) == {
-        "session_uuid", "title_hint", "prompts", "tool_cmds", "n_tools", "n_edits", "churn",
-        "loops", "model", "input_tokens", "output_tokens", "first_ts", "last_ts", "duration_s",
-        "cwd", "git_branch", "n_lines"}
+        "session_uuid", "cli", "title_hint", "prompts", "tool_cmds", "n_tools", "n_edits",
+        "churn", "loops", "model", "input_tokens", "output_tokens", "first_ts", "last_ts",
+        "duration_s", "cwd", "git_branch", "n_lines"}
 
 
 def test_scan_cursor_stability_and_dedup(monkeypatch):

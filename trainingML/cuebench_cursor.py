@@ -218,6 +218,7 @@ def parse_cursor_composer(composer_id: str, db: str | None = None) -> dict:
     c.close()
     return {
         "session_uuid": cid,
+        "cli": "cursor",
         "title_hint": (cd.get("name") or "").strip() or None,   # Cursor's own composer name
         "prompts": prompts,
         "tool_cmds": tool_cmds,
@@ -238,7 +239,7 @@ def parse_cursor_composer(composer_id: str, db: str | None = None) -> dict:
 
 
 def _empty(cid: str) -> dict:
-    return {"session_uuid": cid, "title_hint": None,
+    return {"session_uuid": cid, "cli": "cursor", "title_hint": None,
             "prompts": [], "tool_cmds": [], "n_tools": 0, "n_edits": 0,
             "churn": 0, "loops": 0, "model": None, "input_tokens": 0, "output_tokens": 0,
             "first_ts": None, "last_ts": None, "duration_s": 0, "cwd": None,
