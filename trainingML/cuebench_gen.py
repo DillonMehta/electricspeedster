@@ -69,20 +69,22 @@ _NEUTRALITY = (
     "BAD: 'The billing refactor was vague.'"
 )
 
-# Prompt-informed insights (opt-in) swaps the numbers-only neutrality preamble for one that
-# LETS the model read the operator's own prompts, so coaching can name what was asked and how
-# it was scoped. Same content-aware class as content_title/trace: the prompts go ONLY to the
-# user's own BYOK endpoint, but the generated insight TEXT — which may now reference the task —
-# does enter the payload. OFF by default; numbers-only neutrality applies otherwise.
+# Grounded insights (opt-in) swap the numbers-only neutrality preamble for one that LETS the
+# model read the operator's own prompts AND the session EVENT MENU (files edited, tool loops
+# with turn ranges, verify runs, close), so coaching can name the real file/turn/message/
+# outcome the way the insights guide requires. Same content-aware class as trace: the raw
+# content goes ONLY to the user's own BYOK endpoint, but the generated insight TEXT — which may
+# now reference what happened — does enter the payload. OFF by default; numbers-only neutrality
+# applies otherwise.
 _INSIGHTS_CONTENT_PREAMBLE = (
-    "You are a coding-process analyst for CueBench. You are given derived metrics about ONE "
-    "agentic coding session AND the operator's own prompts from that session. Use the prompts "
-    "to make coaching CONCRETE: you MAY reference what the operator asked for and how they "
-    "scoped, sequenced, and phrased it. Keep the focus on DRIVING BEHAVIOUR — how the work was "
-    "delegated, specified, reviewed, and followed through — not on the subject matter for its "
-    "own sake. Use ONLY facts present in the prompts or metrics; do NOT invent specifics, and "
-    "do NOT quote long verbatim passages — paraphrase briefly and tie behaviour to what was "
-    "actually requested."
+    "You are a coding-process analyst for CueBench writing post-session coaching for ONE "
+    "agentic coding session. You are given derived metrics, the operator's own prompts, and a "
+    "timeline of REAL events from the session (files edited, tool loops with turn ranges, "
+    "verification runs, how it closed). Make every point SPECIFIC and BEHAVIOURAL — grounded in "
+    "what actually happened, naming the real file, turn, message, loop, or outcome. Keep the "
+    "focus on DRIVING BEHAVIOUR — how the work was delegated, specified, steered, and validated "
+    "— not the subject matter for its own sake. Use ONLY facts present in the metrics, prompts, "
+    "or events; never invent a file, name, number, or outcome that is not there."
 )
 
 
@@ -230,37 +232,69 @@ class Generator:
     # no prompt sent off-device for naming. BYOK now powers only insights / trace / specificity.
 
     def insights(self, metrics: dict, vectors: dict, quality: dict | None = None,
-                 prompts: list[str] | None = None) -> dict | None:
+                 prompts: list[str] | None = None, events: dict | None = None) -> dict | None:
         """{'strengths':[{axis,point}...], 'improvements':[{axis,point}...]} or None.
 
-        2-3 of each; every item tied to one of the four axes. Each `point` must be SPECIFIC
-        (cite the metric value that justifies it) and, for improvements, ACTIONABLE (end with
-        a concrete behaviour to do next session) — generic coaching like "improve diligence"
-        is explicitly disallowed. The tone is kept coherent with the headline quality zone
-        (see _coherence_clause): a 'Critical'/'Needs attention' verdict must not read as mild
-        encouragement.
+        1-2 of each (more is NOT better); every item tied to one of the four axes. The axis
+        SCORES pick which axes to praise (highest) and coach (lowest); each `point` is the
+        EVIDENCE behind the score, never the score itself. The tone is kept coherent with the
+        headline quality zone (see _coherence_clause): a 'Critical'/'Needs attention' verdict
+        must not read as mild encouragement.
 
-        PROMPT-INFORMED (opt-in): when CUEBENCH_INSIGHTS_PROMPTS is set AND `prompts` is
-        passed, the operator's own prompts are appended to the user message so coaching can
-        reference what was asked / how it was scoped. The prompts go ONLY to the user's own
-        BYOK endpoint, but the resulting insight TEXT may then reference the task and DOES
-        enter the payload (same content-aware tradeoff as content_title/trace). OFF by default
-        -> numbers-only and structurally neutral exactly as before.
+        TWO MODES (privacy):
+          • numbers-only (default) — fed ONLY derived metrics; each point cites the metric value
+            that justifies it. Structurally neutral: the model never sees raw content.
+          • grounded (opt-in, CUEBENCH_INSIGHTS_PROMPTS) — additionally fed the operator's own
+            prompts AND the session EVENT MENU (files edited, tool loops + turn ranges, verify
+            runs, how it closed), so coaching can name the real file/turn/message/outcome the
+            way the insights guide requires. Raw content goes ONLY to the user's own BYOK
+            endpoint; only the generated coaching TEXT enters the payload (and the dry-run
+            neutrality scan exempts `insights` exactly when this mode is on).
         """
-        use_prompts = bool(self.enabled and self.insights_prompts_enabled and prompts)
-        preamble = _INSIGHTS_CONTENT_PREAMBLE if use_prompts else _NEUTRALITY
-        # Rule 4 toggles with the mode: numbers-only forbids subject matter outright; the
-        # prompt-informed preamble already permits referencing the task, so allow it but keep
-        # each point anchored to behaviour (not a content summary).
-        rule_4 = ("4. You MAY reference what was asked (from the prompts) to make a point "
-                  "concrete, but keep each point about DRIVING BEHAVIOUR and never quote long "
-                  "verbatim text.\n") if use_prompts else \
-                 "4. Behaviour only — never the subject matter.\n"
-        system = preamble + (
+        grounded = bool(self.enabled and self.insights_prompts_enabled and (events or prompts))
+        system = (self._insights_system_grounded(quality) if grounded
+                  else self._insights_system_numbers(quality))
+        user = self._metrics_block(metrics, vectors, quality)
+        if grounded:                                 # opt-in: append real content to the USER msg
+            # The event menu already carries the operator's prompt text (open/prompt events) plus
+            # files/loops/verifies/close — richer than prompts alone; fall back to prompts only if
+            # the menu couldn't be built. (_metrics_block stays numbers-only — content goes here.)
+            user += "\n\n" + (self._events_block(events) if events
+                              else self._prompts_block(prompts))
+        raw = self._complete(system, user, max_tokens=900)
+        data = _extract_json(raw) if raw else None
+        if not isinstance(data, dict):
+            return None
+        out = {}
+        for bucket in ("strengths", "improvements"):
+            items = data.get(bucket)
+            clean = []
+            if isinstance(items, list):
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    axis = str(it.get("axis", "")).strip().lower()
+                    point = str(it.get("point", "")).strip()
+                    if axis in AXES and point:
+                        # 400-char safety net: the "one sentence" rule keeps points short; this
+                        # only bounds pathological output (grounded points cite a file/turn AND
+                        # the habit to change, so they run longer than numbers-only).
+                        clean.append({"axis": axis, "point": point[:400]})
+            out[bucket] = clean[:2]                   # 1-2 per bucket (guide: more is not better)
+        if not out.get("strengths") and not out.get("improvements"):
+            return None
+        return out
+
+    # --- the two insights system prompts (numbers-only default / grounded opt-in) ---------
+    @staticmethod
+    def _insights_system_numbers(quality: dict | None) -> str:
+        """Numbers-only coaching: the model sees ONLY derived metrics, so every point must cite
+        a metric value. Structurally neutral — it cannot reference content it was never given."""
+        return _NEUTRALITY + (
             " Produce SPECIFIC, ACTIONABLE per-session coaching as STRICT JSON: "
             '{"strengths":[{"axis":"<one of delegation|description|discernment|diligence>",'
             '"point":"<text>"}],"improvements":[{"axis":"...","point":"..."}]}. '
-            "Give 2-3 strengths and 2-3 improvements, each point AT MOST 2 sentences. "
+            "Give 1-2 strengths and 1-2 improvements, each point AT MOST 2 sentences. "
             "Output ONLY JSON.\n"
             "RULES FOR EVERY point — this is what makes coaching useful, not filler:\n"
             "1. CITE THE NUMBER. Ground each point in the specific metric value(s) that "
@@ -279,7 +313,7 @@ class Generator:
             "reflects the session type (e.g. a read/plan session legitimately has few edits), "
             "it is NOT a weakness — do not manufacture an improvement for it.\n"
             "3. Tie each item to the axis whose score/signals most support it.\n"
-            + rule_4 +
+            "4. Behaviour only — never the subject matter.\n"
             "SIGNAL GLOSSARY (what the numbers mean): verify_runs = test/typecheck/lint/"
             "build commands; loops = exact-duplicate tool re-runs (retrying the same thing); "
             "churn = total written lines (large => big, hard-to-review changes); n_commits / "
@@ -294,32 +328,55 @@ class Generator:
             "lot of churn and no testing this session; consider being more careful and "
             "testing more.'"
         ) + _coherence_clause(quality)
-        user = self._metrics_block(metrics, vectors, quality)
-        if use_prompts:                              # opt-in path: append prompts to the USER msg
-            user += "\n\n" + self._prompts_block(prompts)   # (NOT _metrics_block — that stays numbers-only)
-        raw = self._complete(system, user, max_tokens=900)
-        data = _extract_json(raw) if raw else None
-        if not isinstance(data, dict):
-            return None
-        out = {}
-        for bucket in ("strengths", "improvements"):
-            items = data.get(bucket)
-            clean = []
-            if isinstance(items, list):
-                for it in items:
-                    if not isinstance(it, dict):
-                        continue
-                    axis = str(it.get("axis", "")).strip().lower()
-                    point = str(it.get("point", "")).strip()
-                    if axis in AXES and point:
-                        # 400-char safety net: the "<=2 sentences" rule keeps points short;
-                        # this only bounds pathological output (prompt-informed points cite
-                        # the phrasing AND a directive, so they run longer than numbers-only).
-                        clean.append({"axis": axis, "point": point[:400]})
-            out[bucket] = clean[:3]
-        if not out.get("strengths") and not out.get("improvements"):
-            return None
-        return out
+
+    @staticmethod
+    def _insights_system_grounded(quality: dict | None) -> str:
+        """Grounded coaching (opt-in): the model is fed the operator's prompts + the session
+        event menu, so every point names a real file/turn/message/loop/outcome. Implements the
+        CueBench insights guide — behavioural, one sentence, score-as-selector-not-quote."""
+        return _INSIGHTS_CONTENT_PREAMBLE + (
+            " Produce post-session coaching as STRICT JSON: "
+            '{"strengths":[{"axis":"<delegation|description|discernment|diligence>",'
+            '"point":"<one sentence>"}],"improvements":[{"axis":"...","point":"..."}]}. '
+            "Give 1-2 strengths and 1-2 improvements (more is NOT better). Output ONLY JSON.\n"
+            "AXES — tag each point with the one it is really about:\n"
+            "- delegation: how the operator set the agent up BEFORE invoking — task scoping, the "
+            "files/context handed over, success criteria, what was put out of scope.\n"
+            "- description: how precisely they communicated DURING — prompt specificity, output "
+            "format/constraints stated, and how good the follow-ups were when the first try missed.\n"
+            "- discernment: how they monitored and steered — catching a loop and redirecting, "
+            "spotting off-track work, model-tier choice, knowing when to stop vs keep going.\n"
+            "- diligence: how they validated the result — reviewing the diff, running tests, "
+            "catching unintended changes, confirming the fix actually worked.\n"
+            "USE THE AXIS SCORES TO CHOOSE, NOT TO QUOTE: the 0-100 axis scores tell you which "
+            "axes to praise (highest) and which to coach (lowest) — but NEVER restate a score "
+            "('your delegation score was 78' is banned). The score is the conclusion; your point "
+            "is the EVIDENCE behind it.\n"
+            "RULES FOR EVERY POINT:\n"
+            "1. ONE sentence, grounded in something that ACTUALLY happened this session — a file "
+            "basename, a turn or turn range, the operator's own words, a specific loop, a verify "
+            "run, or an outcome. SPECIFICITY TEST: if the sentence could describe a different "
+            "session, it is too generic — add the file/turn/message/outcome that makes it unique "
+            "to this one, or drop it.\n"
+            "2. STRENGTHS state what the operator did AND what it achieved: 'did X, which "
+            "caused/prevented Y'.\n"
+            "3. IMPROVEMENTS state what happened AND the habit to change next time: 'X happened; "
+            "doing Y next session would Z' — name the fix, not just the problem.\n"
+            "4. Never name a competency axis in the point text (the axis field already labels "
+            "it). Never quote long verbatim text — paraphrase the operator's words briefly.\n"
+            "BANNED OPENERS (filler — never start a point with these): \"It's important to\", "
+            "'Consider', 'You should', 'Great job', 'This demonstrates', 'Moving forward'. "
+            "BANNED: generic advice that fits any session ('be more specific', 'review diffs', "
+            "'test more', 'improve <axis>') with no reference to what happened here; bare praise "
+            "('good scoping') with no evidence; restating a score.\n"
+            "EXAMPLE good strength: 'The opening message named the exact function to fix and "
+            "attached the file, so the agent had no ambiguity to resolve before starting.' "
+            "EXAMPLE good improvement: 'The agent re-ran the same approach across turns 4-8 with "
+            "no progress and wasn't redirected until turn 9 — stepping in once the second repeat "
+            "appeared would have saved roughly 3 minutes.' "
+            "EXAMPLE bad (never produce): 'Good scoping on this task.' / 'Consider being more "
+            "specific in future prompts.' / 'Your discernment score reflects strong steering.'"
+        ) + _coherence_clause(quality)
 
     def trace(self, session: dict | None) -> list | None:
         """FACTUAL session trace built from a PRE-EXTRACTED, TIMESTAMPED EVENT MENU.
@@ -442,13 +499,29 @@ class Generator:
                                 if quality.get(k) is not None}
         return json.dumps(block, ensure_ascii=False, sort_keys=True)
 
-    # --- the OPT-IN content the model sees ONLY in prompt-informed insights mode ----
+    # --- the OPT-IN content the model sees ONLY in grounded insights / trace mode ---
+    @staticmethod
+    def _events_block(events: dict | None, max_chars: int = 6000) -> str:
+        """Format the session EVENT MENU for grounded insights (opt-in only). Same factual,
+        timestamped timeline the trace is built from (cuebench_agent.build_session_events): the
+        opening/steering prompts, tool loops with turn ranges, the context build, per-file edits,
+        verify runs, model, and close. Sent ONLY to the user's own BYOK endpoint, NEVER stored in
+        the payload; char-capped so a long session can't balloon the request."""
+        if not events:
+            return ""
+        compact = {k: events.get(k) for k in ("duration", "totals", "events")}
+        body = json.dumps(compact, ensure_ascii=False)[:max_chars]
+        return ("SESSION EVENTS — real moments from THIS session; cite these to ground each "
+                "point (file basenames, loop targets + turn ranges, verify commands, the "
+                "operator's own opening/steering messages, how it closed). These go ONLY to your "
+                "own endpoint and are never stored:\n" + body)
+
     @staticmethod
     def _prompts_block(prompts: list[str] | None,
                        max_chars: int = 3500, max_prompts: int = 20) -> str:
-        """Format the operator's prompts for prompt-informed insights (opt-in only). Sent ONLY
-        to the user's own BYOK endpoint, NEVER stored in the payload. Capped (count + chars) so
-        a long session can't balloon the request or its cost."""
+        """Format the operator's prompts for grounded insights (opt-in fallback when the event
+        menu is unavailable). Sent ONLY to the user's own BYOK endpoint, NEVER stored in the
+        payload. Capped (count + chars) so a long session can't balloon the request or its cost."""
         lines, budget = [], max_chars
         for i, p in enumerate((prompts or [])[:max_prompts], 1):
             p = (p or "").strip()

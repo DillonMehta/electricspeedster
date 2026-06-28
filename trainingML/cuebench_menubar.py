@@ -82,7 +82,7 @@ SETTINGS_PLACEHOLDERS = {
 # so each states what IT does (and, for content-aware ones, the privacy implication).
 TOGGLE_HINTS = {
     "CUEBENCH_TRACE": "Generate timeline trace (needs a BYOK key)",
-    "CUEBENCH_INSIGHTS_PROMPTS": "Send your prompts to your BYOK endpoint",
+    "CUEBENCH_INSIGHTS_PROMPTS": "Ground insights in your prompts + session timeline (sent to your BYOK endpoint)",
 }
 
 # A score line printed by the engine's process_one(), e.g.:

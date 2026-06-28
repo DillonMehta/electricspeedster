@@ -625,19 +625,22 @@ def build_payload(parsed: dict, scorer: ModelScorer, store: Store, gen: Generato
         insights, trace = cached["insights"], cached["trace"]
         gen_status = "cache"
     elif gen.enabled:
-        # insights are numbers-only UNLESS prompt-informed mode is on (CUEBENCH_INSIGHTS_PROMPTS):
-        # then gen.insights feeds these prompts to its own BYOK endpoint so coaching can
-        # reference what was asked. The flag is checked inside insights(); passing prompts
-        # unconditionally is safe — they're ignored when the opt-in is off.
-        insights = gen.insights(metrics, vectors, quality, prompts=parsed["prompts"])
-        # Trace = a factual, timestamped EVENT MENU from the whole session timeline
-        # (build_session_events: opening prompt, redirects, tool loops, context build, edits,
-        # verify runs, model, close). The model labels the notable events and references each
-        # by its integer id; the TIME on every entry is code-computed here and stamped by the
-        # generator from that id — the AI never sees or authors a timestamp, and can only point
-        # at an event we extracted (no fabrication).
-        trace = (gen.trace(build_session_events(parsed["path"], parsed["first_ts"], parsed["last_ts"]))
-                 if gen.trace_enabled else None)
+        # The factual, timestamped EVENT MENU (build_session_events: opening prompt, redirects,
+        # tool loops + turn ranges, context build, edits, verify runs, model, close) feeds BOTH
+        # content-aware paths, so build it ONCE when either is on. Trace labels events by id;
+        # grounded insights cite them to name a real file/turn/message/outcome.
+        events = (build_session_events(parsed["path"], parsed["first_ts"], parsed["last_ts"])
+                  if (gen.trace_enabled or gen.insights_prompts_enabled) else None)
+        # insights are numbers-only UNLESS grounded mode is on (CUEBENCH_INSIGHTS_PROMPTS): then
+        # gen.insights feeds the operator's prompts AND the event menu to its own BYOK endpoint so
+        # coaching can name what actually happened. The flag is checked inside insights(); passing
+        # prompts/events unconditionally is safe — they're ignored when the opt-in is off.
+        insights = gen.insights(metrics, vectors, quality,
+                                prompts=parsed["prompts"], events=events)
+        # Trace: the model labels the notable events and references each by its integer id; the
+        # TIME on every entry is code-computed here and stamped by the generator from that id —
+        # the AI never sees or authors a timestamp, and can only point at an event we extracted.
+        trace = gen.trace(events) if gen.trace_enabled else None
         # Provider reachable iff a BYOK product came back -> persist (paid once). specificity is
         # local now, so it does NOT signal reachability; gate only on the BYOK outputs.
         if insights is not None or trace is not None:
