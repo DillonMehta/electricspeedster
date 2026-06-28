@@ -102,6 +102,7 @@ MANAGED_ENV_KEYS = (
     "CUEBENCH_BYOK_KEY",      # BYOK key — enables neutral title/insights generation
     "CUEBENCH_BYOK_MODEL",    # BYOK model id (provider inferred)
     "CUEBENCH_TRACE",         # "1" -> also generate the session timeline trace (needs BYOK)
+    "CUEBENCH_INSIGHTS_PROMPTS",  # "1" -> prompt-informed insights: feed prompts to coaching (needs BYOK)
 )
 
 

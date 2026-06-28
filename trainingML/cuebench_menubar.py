@@ -48,6 +48,7 @@ SETTINGS_FIELDS = [
     ("CUEBENCH_BYOK_KEY",    "BYOK key (generation)", "secret"),
     ("CUEBENCH_BYOK_MODEL",  "BYOK model", "choice"),
     ("CUEBENCH_TRACE",       "Session trace", "toggle"),
+    ("CUEBENCH_INSIGHTS_PROMPTS", "Prompt-informed insights", "toggle"),
 ]
 
 
@@ -74,7 +75,14 @@ SETTINGS_PLACEHOLDERS = {
     "CUEBENCH_EMPLOYEE_ID": "e.g. dillonmehta",
     "CUEBENCH_API_URL": "https://…/api/ingest   (blank = don't forward)",
     "CUEBENCH_API_KEY": "paste dashboard API key",
-    "CUEBENCH_BYOK_KEY": "sk-…   (blank = no generated titles)",
+    "CUEBENCH_BYOK_KEY": "sk-…   (blank = no insights/trace; titles are always local)",
+}
+
+# Inline helper shown ON each toggle's checkbox. Per env key — toggles are NOT interchangeable,
+# so each states what IT does (and, for content-aware ones, the privacy implication).
+TOGGLE_HINTS = {
+    "CUEBENCH_TRACE": "Generate timeline trace (needs a BYOK key)",
+    "CUEBENCH_INSIGHTS_PROMPTS": "Send your prompts to your BYOK endpoint",
 }
 
 # A score line printed by the engine's process_one(), e.g.:
@@ -151,20 +159,12 @@ def read_settings() -> dict:
     return {k: env.get(k, "") for k in d.MANAGED_ENV_KEYS}
 
 
-# ---- AI rename of a session's menu label ----------------------------------
-# NOTE: this is the ONE place that sends a raw prompt off-device. The daemon's automatic
-# titles are numbers-only; this is an explicit, user-initiated, per-session action that
-# sends just that session's FIRST prompt to YOUR OWN BYOK provider to make a short title.
-# The result only relabels the menu (it is not re-sent to the dashboard).
+# ---- Session menu-label overrides -----------------------------------------
+# Titles are now produced automatically and ON-DEVICE by the scoring pipeline (the operator's
+# own first prompt, classified locally — see cuebench_classify). No raw prompt is sent
+# off-device for naming any more. This file is still honored if present so a user can hand-edit
+# a label, but nothing in the app writes to it (the BYOK "Rename with AI" action was removed).
 TITLE_OVERRIDES_PATH = os.path.join(d.CONTROL_DIR, "title_overrides.json")
-_SYSREM_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
-_CMDOUT_RE = re.compile(r"<(local-command-stdout|command-name|command-message|command-args)>.*?</\1>",
-                        re.DOTALL)
-
-
-def byok_key_present() -> bool:
-    env = d.parse_env_file(d.ENVFILE)
-    return bool(env.get("CUEBENCH_BYOK_KEY") or os.environ.get("CUEBENCH_BYOK_KEY"))
 
 
 def read_title_overrides() -> dict:
@@ -174,100 +174,6 @@ def read_title_overrides() -> dict:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
-
-
-def set_title_override(sid: str, title: str) -> None:
-    d._ensure_dirs()
-    data = read_title_overrides()
-    data[sid] = title
-    tmp = TITLE_OVERRIDES_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, TITLE_OVERRIDES_PATH)
-
-
-def resolve_session_path(basename: str | None) -> str | None:
-    if not basename:
-        return None
-    projects = d.parse_env_file(d.ENVFILE).get("CUEBENCH_PROJECTS_DIR") or d.DEFAULT_PROJECTS
-    for p in glob.glob(os.path.join(projects, "**", basename), recursive=True):
-        return p
-    return None
-
-
-def first_human_prompt(path: str) -> str | None:
-    """The first genuine operator prompt in a transcript (mirrors the engine's human-prompt
-    filter; read-only, no torch import)."""
-    try:
-        with open(path, errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                if rec.get("type") != "user":
-                    continue
-                msg = rec.get("message") or {}
-                if msg.get("role") != "user":
-                    continue
-                content = msg.get("content")
-                if isinstance(content, list) and any(
-                        isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
-                    continue
-                if rec.get("isMeta") or rec.get("sourceToolUseID") or rec.get("interruptedMessageId"):
-                    continue
-                origin = rec.get("origin") or {}
-                if not (origin.get("kind") == "human" or rec.get("promptSource")):
-                    continue
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    text = "\n".join(b.get("text", "") for b in content
-                                     if isinstance(b, dict) and b.get("type") == "text")
-                else:
-                    text = ""
-                text = _CMDOUT_RE.sub(" ", _SYSREM_RE.sub(" ", text)).strip()
-                if text:
-                    return text
-    except Exception:
-        return None
-    return None
-
-
-def _shorten_title(raw: str, max_chars: int = 32) -> str:
-    """Trim a model title to something that fits a menu without cutting a word mid-way."""
-    title = (raw or "").strip().strip('"').strip("'").strip()
-    title = title.splitlines()[0].strip() if title else ""
-    if len(title) > max_chars:
-        title = title[:max_chars].rsplit(" ", 1)[0].strip() or title[:max_chars].strip()
-    return title.rstrip(" .")
-
-
-def make_short_title(first_prompt: str, max_chars: int = 32) -> tuple[bool, str]:
-    """Generate a very short title from a session's first prompt via the BYOK provider.
-    Returns (ok, title_or_error). Sends the prompt to the user's own BYOK endpoint only."""
-    env = d.parse_env_file(d.ENVFILE)
-    key = env.get("CUEBENCH_BYOK_KEY") or os.environ.get("CUEBENCH_BYOK_KEY")
-    if not key:
-        return False, "No BYOK key set — add one in Settings to enable AI rename."
-    try:
-        from cuebench_gen import Generator   # lightweight: no torch
-    except Exception as e:
-        return False, f"Could not load the generator: {e!r}"
-    gen = Generator(key=key,
-                    provider=env.get("CUEBENCH_BYOK_PROVIDER") or None,
-                    model=env.get("CUEBENCH_BYOK_MODEL") or None)
-    system = ("You write extremely short titles for a coding session. Given the operator's "
-              f"first prompt, reply with ONLY a title of at most 5 words and at most {max_chars} "
-              "characters. No quotes, no trailing punctuation, no emoji. Name the task, not filler.")
-    raw = gen._complete(system, (first_prompt or "")[:2000], max_tokens=24)
-    if not raw:
-        return False, "The model returned nothing (check your BYOK key / provider / model)."
-    title = _shorten_title(raw, max_chars)
-    return (True, title) if title else (False, "Generated an empty title.")
 
 
 # ---- Developer: preview the exact privacy-safe payload that gets shipped ----
@@ -556,8 +462,9 @@ def build_settings_window(cur, target=None,
     content.addSubview_(title)
 
     hint = NSTextField.wrappingLabelWithString_(
-        "Forwarding POSTs your scores to a dashboard. BYOK generates neutral titles/"
-        "insights — pick a model that matches your BYOK key's provider.")
+        "Forwarding POSTs your scores to a dashboard. Titles + task type are generated locally "
+        "(no key needed); BYOK generates coaching insights/trace — pick a model that matches "
+        "your BYOK key's provider.")
     hint.setFont_(NSFont.systemFontOfSize_(11))
     hint.setTextColor_(NSColor.secondaryLabelColor())
     hint.setFrame_(NSMakeRect(PAD, H - 78, W - 2 * PAD, 32))
@@ -588,7 +495,7 @@ def build_settings_window(cur, target=None,
         elif kind == "toggle":
             cb = NSButton.alloc().initWithFrame_(NSMakeRect(FIELD_X, y - 2, FIELD_W, 22))
             cb.setButtonType_(3)                    # NSSwitchButton (a checkbox)
-            cb.setTitle_("Generate timeline trace (needs a BYOK key)")
+            cb.setTitle_(TOGGLE_HINTS.get(key, label))   # per-key helper (not the same for every toggle)
             cb.setState_(1 if _env_truthy(cur.get(key, "")) else 0)
             content.addSubview_(cb)
             fields[key] = cb
@@ -762,9 +669,11 @@ def run_menubar():
             self.menu.addItem_(NSMenuItem.separatorItem())
 
         @objc.python_method
-        def _add_session_item(self, r, has_byok):
+        def _add_session_item(self, r, has_byok=False):
             # A session row is a SUBMENU (macOS can't right-click a menu item): the visible
-            # NAME is the title; hover to reveal details + the AI-rename action.
+            # NAME is the title (the operator's own first prompt, classified locally); hover to
+            # reveal the score / quality / status. (The BYOK "Rename with AI" action was removed —
+            # titles + task type are now generated automatically and on-device.)
             tag = "dry-run" if r["dry_run"] else ("posted" if r["posted"] else "queued")
             name = r["title"] or r["sid"]
             parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("", None, "")
@@ -782,18 +691,6 @@ def run_menubar():
             ti.setAttributedTitle_(detail)
             ti.setEnabled_(False)
             sub.addItem_(ti)
-            sub.addItem_(NSMenuItem.separatorItem())
-            if has_byok:
-                ri = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                    "✨ Rename with AI", "doRenameSession:", "")
-                ri.setTarget_(self)
-                ri.setRepresentedObject_(r["sid"])
-                ri.setEnabled_(True)
-            else:
-                ri = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                    "Set a BYOK key in Settings to enable AI rename", None, "")
-                ri.setEnabled_(False)
-            sub.addItem_(ri)
             parent.setSubmenu_(sub)
             self.menu.addItem_(parent)
 
@@ -819,17 +716,14 @@ def run_menubar():
 
             self._sep()
             self._add("", enabled=False, attr=self._attr(
-                "RECENT SESSIONS  ·  HOVER ▸ TO RENAME", size=10, color=ter, kern=0.5))
+                "RECENT SESSIONS  ·  HOVER ▸ FOR DETAIL", size=10, color=ter, kern=0.5))
             rows = recent_sessions(6)
-            self._session_files = {}
             if not rows:
                 self._add("", enabled=False, indent=1, attr=self._attr(
                     "None yet — scores appear as sessions finish", size=12, color=ter))
             else:
-                has_byok = byok_key_present()
                 for r in rows:
-                    self._session_files[r["sid"]] = r.get("file")
-                    self._add_session_item(r, has_byok)
+                    self._add_session_item(r)
 
             self._sep()
             if st["running"]:
@@ -946,35 +840,8 @@ def run_menubar():
         def doRefresh_(self, _s):
             self.rebuild()
 
-        # -- AI rename of a session label -----------------------------------
-        def doRenameSession_(self, sender):
-            sid = sender.representedObject()
-            basename = (getattr(self, "_session_files", None) or {}).get(sid)
-            import threading
-            threading.Thread(target=self._do_rename, args=(sid, basename), daemon=True).start()
-
-        @objc.python_method
-        def _do_rename(self, sid, basename):
-            path = resolve_session_path(basename)
-            if not path:
-                AppHelper.callAfter(self._alert, "Rename failed",
-                                    f"Couldn't locate the transcript for {sid}.")
-                return
-            prompt = first_human_prompt(path)
-            if not prompt:
-                AppHelper.callAfter(self._alert, "Rename failed",
-                                    "No operator prompt was found in that session.")
-                return
-            ok, result = make_short_title(prompt)
-            if not ok:
-                AppHelper.callAfter(self._alert, "Rename failed", result)
-                return
-            set_title_override(sid, result)
-            print(f"[menubar] renamed {sid} -> {result!r}", flush=True)
-            AppHelper.callAfter(self.rebuild)
-            AppHelper.callAfter(self._alert, "Renamed",
-                                f"{sid} is now “{result}”.\n\nGenerated from the session's first "
-                                "prompt via your BYOK model. Reopen the menu to see it.")
+        # (The BYOK "Rename with AI" action was removed: titles + task type are produced
+        #  automatically and on-device by the scoring pipeline — no per-session AI call.)
 
         # -- developer ------------------------------------------------------
         def doOpenConfig_(self, _s):

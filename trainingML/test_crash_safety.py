@@ -166,7 +166,8 @@ def test_generation_cached_before_crash_is_reused_no_rebyok(tmp_path, monkeypatc
     store1 = Store(db)
     with pytest.raises(RuntimeError):
         agent.process_one(transcript, scorer, store1, gen1)
-    assert gen1.calls == 2                                  # title + insights were generated (paid)
+    assert gen1.calls == 1                                  # insights is the ONLY BYOK call now
+                                                            # (the title is generated locally, free)
     assert store1.get_generation(SID) is not None          # ...and committed BEFORE the POST
     assert store1.is_posted(SID) is False                  # POST never succeeded
     store1.close()
@@ -178,6 +179,11 @@ def test_generation_cached_before_crash_is_reused_no_rebyok(tmp_path, monkeypatc
     store2 = Store(db)
     status, _ = agent.process_one(transcript, scorer, store2, gen2)
     assert status == "posted"
-    assert gen2.calls == 0                                  # generated-but-not-sent survived: NO re-pay
-    assert server.by_sid[SID]["title"] == "Steady, well-verified work"   # cached text was used
+    assert gen2.calls == 0                                  # cached insights survived: NO re-pay
+    # Title is now LOCAL: a short keyphrase-extracted title (verb + salient phrase), NOT a BYOK
+    # call and NOT the verbatim prompt. Present even on the cache-reuse path. The prompt
+    # "please implement the described feature ..." -> "Implement described feature".
+    assert server.by_sid[SID]["title"] == "Implement described feature"
+    assert len(server.by_sid[SID]["title"].split()) <= 5     # always short
+    assert server.by_sid[SID]["taskType"] == "feature"
     store2.close()

@@ -162,30 +162,12 @@ def digest_text(inputs: dict, max_prompt_chars: int = 4000) -> str:
     return head + "\nPROMPTS:" + "".join(prompts)
 
 # ============================================================================
-# 5. SPECIFICITY  (Description deterministic signal) — BYOK embeddings.
-#    Optional: the model already scores Description; this is the deterministic
-#    cross-check / no-LLM-tier value. Uses the org's BYOK key.
+# 5. SPECIFICITY  (Description cross-check) — MOVED to cuebench_classify.
+#    Specificity is now computed LOCALLY via the on-device encoder
+#    (EmbeddingTypeClassifier.specificity) — no external embeddings API, no raw prompt text
+#    sent off-device. The old OpenAI-BYOK implementation (and its pole phrases) were removed
+#    from here; this module stays torch-free and deterministic.
 # ============================================================================
-_VAGUE = ["make it nice","fix it","make it better","clean it up","improve this",
-          "do the thing","make it work","handle it","just make it good"]
-_SPECIFIC = ["add a 300ms debounce to the search handler in search.js",
-    "fix the off-by-one in pagination offset when page=0",
-    "return 404 instead of 500 when the record id is missing",
-    "add a unit test asserting the parser rejects inputs over 1MB"]
-
-def specificity(prompts: list[str], openai_client) -> float | None:
-    """0-100 specificity via embedding distance to specific/vague poles. BYOK."""
-    texts = [p for p in prompts if p and len(p.split())>=2]
-    if not texts or openai_client is None: return None
-    import numpy as np
-    def emb(ts):
-        r = openai_client.embeddings.create(model="text-embedding-3-large",
-                                            input=[t[:2000] for t in ts])
-        v = np.array([d.embedding for d in r.data], float)
-        n = np.linalg.norm(v,axis=1,keepdims=True); n[n==0]=1; return v/n
-    sv, vv, pv = emb(_SPECIFIC), emb(_VAGUE), emb(texts)
-    margin = (pv@sv.T).max(1) - (pv@vv.T).max(1)
-    return float(np.clip((margin.mean()+0.05)/0.25, 0, 1) * 100)
 
 # ============================================================================
 # 6. CHECKLIST DERIVATION  — from REAL deterministic signals only.

@@ -7,9 +7,10 @@ Pipeline per finished session:
   2. Compute git signals on the repo the session edited.
   3. Assemble inputs via cuebench_signals.build_inputs -> digest_text (the EXACT format
      the model trained on) and score with the local 4D model (model_infer).
-  4. Generate a NEUTRAL title + per-axis insights (and an optional trace) via cuebench_gen
-     from DERIVED NUMBERS ONLY — never raw prompts/code/paths/commands. OFF when no BYOK
-     key; cached per-session in cuebench_store so it is generated (and paid for) once.
+  4. Derive a LOCAL title + 18-way taskType (cuebench_classify: keyphrase-extracted title +
+     rules/embedding) and a local specificity score — all on-device, no BYOK. Optionally add
+     per-axis insights + a trace via cuebench_gen (BYOK, opt-in) from DERIVED NUMBERS ONLY;
+     OFF when no key; cached per-session in cuebench_store so they are paid for once.
   5. POST the privacy-safe payload to the dashboard (deduped per sessionId; never re-POSTed;
      an appended session is re-sent as an UPDATE, not a duplicate insert).
 
@@ -34,6 +35,68 @@ from model_infer import ModelScorer
 from train_cuebench import AXES  # ["delegation","description","discernment","diligence"]
 from cuebench_gen import Generator        # one provider-switched generation module
 from cuebench_store import Store          # local generation cache + POST-sent dedup
+from cuebench_classify import classify as classify_session, EmbeddingTypeClassifier, has_ordinal
+
+# Local task classifier (title + 18-way taskType). 100% on-device, no BYOK: a keyword
+# rule layer with a nearest-centroid fallback over the encoder ModelScorer already holds.
+# Built once and memoized so the 18 anchor centroids are computed a single time.
+_EMBEDDER = None
+def _get_embedder(scorer: ModelScorer):
+    """Reuse the scorer's loaded encoder for task-type embeddings (no 2nd model in RAM).
+    Falls back to rules-only if the encoder can't be tapped. Tried at most once."""
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        try:
+            _EMBEDDER = EmbeddingTypeClassifier.from_scorer(scorer)
+        except Exception as e:
+            print(f"[classify] embedding fallback unavailable ({e!r}); rules-only", file=sys.stderr)
+            _EMBEDDER = False   # sentinel: don't retry every session
+    return _EMBEDDER or None
+
+def _doc_context(parsed: dict, max_chars: int = 80000) -> str | None:
+    """Doc text for resolving an ordinal title ref ('Milestone 0' -> its real section name).
+    Only built when the first prompt actually names an ordinal (cheap gate, rare case).
+    PRIMARY: the file content the agent READ during the session (the transcript's tool_results)
+    — this survives the file being deleted from disk afterward. FALLBACK: the referenced .md
+    still present in the repo. Returns None when there's nothing to read. Never raises."""
+    first = next((p for p in parsed.get("prompts", []) if p and p.strip()), "")
+    if not has_ordinal(first):
+        return None
+    parts, total = [], 0
+    path = parsed.get("path")
+    if path:
+        try:
+            for line in open(path, errors="replace"):
+                if total >= max_chars:
+                    break
+                if "tool_result" not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                c = (rec.get("message") or {}).get("content")
+                if not isinstance(c, list):
+                    continue
+                for b in c:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        t = b.get("content")
+                        if isinstance(t, list):
+                            t = " ".join(x.get("text", "") for x in t if isinstance(x, dict))
+                        if isinstance(t, str) and t:
+                            parts.append(t); total += len(t)
+        except Exception:
+            pass
+    repo = parsed.get("cwd")                              # disk fallback: referenced .md still on disk
+    if total < max_chars and repo and os.path.isdir(repo):
+        refs = list({os.path.basename(r) for r in re.findall(r"[\w./-]+\.md\b", first, re.I)})[:3]
+        for ref in refs:
+            for cand in glob.glob(os.path.join(repo, "**", ref), recursive=True)[:1]:
+                try:
+                    parts.append(open(cand, errors="replace").read(max_chars))
+                except Exception:
+                    pass
+    return "\n".join(parts) if parts else None
 
 # ----------------------------------------------------------------------------
 # Config (env only)
@@ -53,6 +116,7 @@ POLL_INTERVAL  = int(os.environ.get("CUEBENCH_POLL_INTERVAL", "20"))   # seconds
 STABLE_SECONDS = int(os.environ.get("CUEBENCH_STABLE_SECONDS", "60"))  # no growth for this long => finished
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "str_replace_based_edit_tool"}
+READ_TOOLS = {"Read", "Grep", "Glob", "NotebookRead"}   # context-gathering tools (trace events)
 
 # ----------------------------------------------------------------------------
 # 1. JSONL transcript parser  (schema confirmed by inspecting a real ~/.claude file;
@@ -307,39 +371,67 @@ def fmt_date(ts: str | None) -> str:
     return f"{dt.strftime('%b')} {dt.day}, {dt.year}, {dt.strftime('%H:%M')}"
 
 # ----------------------------------------------------------------------------
-# 3b. Session timeline (CONTENT-bearing — built only when the trace is enabled).
-#     This is the one extraction that carries raw file names / commands / prompt
-#     text; it is fed ONLY to the user's own BYOK endpoint by cuebench_gen.trace
-#     (never POSTed raw). Skipped entirely on the default path (trace off).
+# 3b. Session events for the trace (built only when the trace is enabled).
+#     The trace is no longer prompts-only — it is grounded in the WHOLE session
+#     timeline. build_session_events walks the JSONL once and extracts a compact,
+#     FACTUAL, TIMESTAMPED "event menu": the opening prompt, later prompts (redirects),
+#     tool loops (target + count + turn range), the context build (files read before the
+#     first edit), per-file edits, verification runs, the model, and how the session
+#     closed. Every event carries:
+#       • a code-computed elapsed time `t` (MM:SS) — the SOURCE OF TRUTH. The model never
+#         sees or authors a timestamp; it references an event by its integer `id` and the
+#         caller (cuebench_gen.trace) stamps t[id] onto each returned entry.
+#       • an integer `id`, so a generated entry can ONLY point at an event we actually
+#         extracted — the model cannot fabricate a moment that did not happen.
+#     Raw content (prompt text, file basenames, commands) goes ONLY to the user's own BYOK
+#     endpoint; only the short generated labels reach the POSTed payload, and only when
+#     CUEBENCH_TRACE is set. Skipped entirely on the default path (trace off). File targets
+#     are reduced to BASENAMES (never full paths) so the trace stays specific without
+#     shipping the repo's directory structure.
 # ----------------------------------------------------------------------------
-# tool name -> the input key whose value is the salient, human-meaningful argument
-_TOOL_ARG_KEY = {
-    "Bash": "command", "Read": "file_path", "Edit": "file_path", "Write": "file_path",
-    "MultiEdit": "file_path", "NotebookEdit": "notebook_path",
-    "str_replace_based_edit_tool": "path", "Grep": "pattern", "Glob": "pattern",
-}
+def _event_target(name: str, inp: dict) -> str:
+    """Short human target for one tool call: a file BASENAME for file tools, the first line
+    of a Bash command, the pattern for search tools. Never a full path."""
+    fp = inp.get("file_path") or inp.get("notebook_path") or inp.get("path")
+    if fp:
+        return os.path.basename(str(fp)) or str(fp)
+    if name == "Bash":
+        # collapse whitespace (NOT first-line-only — a multi-line `cd …\n&& pytest` would
+        # otherwise display as a bare `cd`, hiding the part that actually ran).
+        cmd = " ".join((inp.get("command") or "").split())
+        return (cmd[:60] if cmd else "bash")
+    if name == "Grep":
+        return f"grep {inp.get('pattern', '')}"[:48]
+    if name == "Glob":
+        return f"glob {inp.get('glob') or inp.get('pattern', '')}"[:48]
+    if name == "Skill":
+        return f"skill {inp.get('skill', '')}"[:48]
+    return name or "tool"
 
-def _tool_descriptor(name: str, inp: dict) -> str:
-    """One-line 'Tool: salient-arg' descriptor for a tool_use block (e.g.
-    'Bash: pytest tests/test_auth.py', 'Edit: session.py'). Truncated; newlines flattened."""
-    val = str((inp or {}).get(_TOOL_ARG_KEY.get(name, ""), "") or "")
-    if not val:                              # unknown tool -> first stringy arg, if any
-        for v in (inp or {}).values():
-            if isinstance(v, str) and v.strip():
-                val = v
-                break
-    val = " ".join(val.split())
-    return f"{name}: {val[:140]}" if val else (name or "tool")
-
-def build_timeline(path: str, first_ts, *, max_tool_events: int = 120,
-                   max_prompts: int = 40) -> dict:
-    """Ordered list of session events with elapsed MM:SS timestamps and turn numbers,
-    for the content-grounded trace. Each event: {turn, t, kind, text}. Keeps every operator
-    prompt (high value, few) and the tool/edit sequence; on a long session keeps the start
-    and end of the tool sequence and records how many middle events were omitted. Bounded
-    so a huge transcript can't blow up memory or BYOK cost."""
+def build_session_events(path: str, first_ts, last_ts=None, *, max_prompts: int = 40) -> dict | None:
+    """Factual, timestamped event menu for the trace — see section 3b above. Returns
+    {"duration","totals","events":[{"id","t","kind",...}]} or None when the transcript
+    can't be read / nothing notable happened. Every event has a stable integer `id` and a
+    code-computed `t` (MM:SS); the generator references events by id and the caller stamps t.
+    Bounded for memory/cost: prompts, loops, edited files and verify runs are each capped,
+    and the JSON the model sees is char-capped in cuebench_gen.trace."""
     base = _parse_ts(first_ts)
-    prompts, tools, seq, turn = [], [], 0, 0
+    def _secs(ts_str) -> int:
+        ts = _parse_ts(ts_str)
+        return max(0, int((ts - base).total_seconds())) if (ts and base) else 0
+
+    prompts: list[dict] = []          # {s, text}
+    loop_sigs: dict[str, dict] = {}   # tool+input -> {count, first_turn, last_turn, s, target}
+    reads: list[dict] = []            # {s, turn, target}  (pre-first-edit reads => context build)
+    edits: dict[str, dict] = {}       # basename -> {count, s, turn}
+    verifies: list[dict] = []         # {s, cmd}
+    model = None
+    turn = 0                          # assistant tool-turn index ~= a conversational turn
+    first_edit_turn = None
+    last_actor = None                 # "operator" | "agent" — who acted last (session close)
+    verify_after_last_edit = False
+    saw_edit = False
+
     try:
         with open(path, "r", errors="replace") as f:
             for line in f:
@@ -350,57 +442,118 @@ def build_timeline(path: str, first_ts, *, max_tool_events: int = 120,
                     rec = json.loads(line)
                 except Exception:
                     continue
-                ts = _parse_ts(rec.get("timestamp"))
-                t = fmt_mmss(int((ts - base).total_seconds())) if (ts and base) else "00:00"
-                typ = rec.get("type")
-                if typ == "user" and _is_human_prompt(rec):
-                    turn += 1
+                rtype, ts = rec.get("type"), rec.get("timestamp")
+                if rtype == "user" and _is_human_prompt(rec):
                     txt = _clean_prompt(_text_from_content((rec.get("message") or {}).get("content")))
-                    if txt:
-                        prompts.append({"i": seq, "turn": turn, "t": t,
-                                        "kind": "prompt", "text": txt[:240]})
-                        seq += 1
-                elif typ == "assistant":
-                    for b in ((rec.get("message") or {}).get("content") or []):
-                        if not isinstance(b, dict) or b.get("type") != "tool_use":
-                            continue
+                    if txt and len(prompts) < max_prompts:
+                        prompts.append({"s": _secs(ts), "text": txt[:400]})
+                    last_actor = "operator"
+                elif rtype == "assistant":
+                    msg = rec.get("message") or {}
+                    if msg.get("model"):
+                        model = msg["model"]
+                    blocks = [b for b in (msg.get("content") or [])
+                              if isinstance(b, dict) and b.get("type") == "tool_use"]
+                    if blocks:
+                        turn += 1
+                        last_actor = "agent"
+                    s = _secs(ts)
+                    for b in blocks:
                         name, inp = b.get("name", ""), (b.get("input") or {})
-                        desc = _tool_descriptor(name, inp)
-                        if name in EDIT_TOOLS:
-                            n = _written_lines(name, inp)
-                            ev = {"i": seq, "turn": turn, "t": t, "kind": "edit",
-                                  "text": f"{desc} (+{n} lines)" if n else desc}
+                        # loop signature: tool + FULL input (matches parse_transcript's
+                        # exact-duplicate definition — re-ran the same call, not normal work).
+                        sig_key = name + "|" + json.dumps(inp, sort_keys=True)
+                        ls = loop_sigs.get(sig_key)
+                        if ls is None:
+                            loop_sigs[sig_key] = {"count": 1, "first_turn": turn, "last_turn": turn,
+                                                  "s": s, "target": _event_target(name, inp)}
                         else:
-                            ev = {"i": seq, "turn": turn, "t": t, "kind": "tool", "text": desc}
-                        tools.append(ev)
-                        seq += 1
+                            ls["count"] += 1
+                            ls["last_turn"] = turn
+                        if name in EDIT_TOOLS:
+                            saw_edit = True
+                            if first_edit_turn is None:
+                                first_edit_turn = turn
+                            tgt = _event_target(name, inp)
+                            e = edits.get(tgt)
+                            if e is None:
+                                edits[tgt] = {"count": 1, "s": s, "turn": turn}
+                            else:
+                                e["count"] += 1
+                            verify_after_last_edit = False     # a later verify re-sets this True
+                        elif name in READ_TOOLS:
+                            reads.append({"s": s, "turn": turn, "target": _event_target(name, inp)})
+                        elif name == "Bash":
+                            cmd = inp.get("command", "")
+                            if cmd and sig.is_verification(cmd):
+                                verifies.append({"s": s, "cmd": " ".join(cmd.split())[:80]})
+                                if saw_edit:
+                                    verify_after_last_edit = True
     except Exception:
-        return {"events": [], "tool_events_omitted": 0}
+        return None
 
-    prompts = prompts[:max_prompts]
-    omitted = 0
-    if len(tools) > max_tool_events:                 # keep the start AND the end of a long run
-        head = int(max_tool_events * 0.7)
-        kept = tools[:head] + tools[-(max_tool_events - head):]
-        omitted = len(tools) - max_tool_events
-    else:
-        kept = tools
-    events = sorted(prompts + kept, key=lambda e: e["i"])
-    for e in events:
-        e.pop("i", None)
-    return {"events": events, "tool_events_omitted": omitted}
+    # ---- assemble the event menu (each event gets a chronological id + MM:SS later) ----
+    raw: list[dict] = []              # carries an internal "_s" for sorting; stripped at the end
+    if model:
+        raw.append({"_s": 0, "kind": "model", "model": model})
+    for i, p in enumerate(prompts):   # first prompt is the opener; the rest are steering turns
+        raw.append({"_s": p["s"], "kind": "open" if i == 0 else "prompt",
+                    "seq": i, "text": p["text"]})
+    # context build: DISTINCT files read before the first edit (or all reads if none) — only
+    # notable when it's a real build (>=3 files); 1-2 reads is routine and is skipped.
+    pre = [r for r in reads if (first_edit_turn is None or r["turn"] < first_edit_turn)]
+    cfiles, seen = [], set()
+    for r in pre:
+        if r["target"] not in seen:
+            seen.add(r["target"]); cfiles.append(r)
+    if len(cfiles) >= 3:
+        raw.append({"_s": cfiles[0]["s"], "kind": "context",
+                    "files": [r["target"] for r in cfiles][:14], "n_files": len(cfiles),
+                    "span": fmt_mmss(cfiles[-1]["s"] - cfiles[0]["s"])})
+    # loops: exact-duplicate re-runs (count>=2), most-repeated first
+    for ls in sorted((v for v in loop_sigs.values() if v["count"] >= 2),
+                     key=lambda v: v["count"], reverse=True)[:12]:
+        raw.append({"_s": ls["s"], "kind": "loop", "target": ls["target"], "count": ls["count"],
+                    "turns": (f'{ls["first_turn"]}-{ls["last_turn"]}'
+                              if ls["last_turn"] > ls["first_turn"] else str(ls["first_turn"]))})
+    # edits: one per file, busiest first (lets the model spot an out-of-scope file touch)
+    for tgt, e in sorted(edits.items(), key=lambda kv: kv[1]["count"], reverse=True)[:12]:
+        raw.append({"_s": e["s"], "kind": "edit", "file": tgt, "edits": e["count"]})
+    for v in verifies[:8]:
+        raw.append({"_s": v["s"], "kind": "verify", "cmd": v["cmd"]})
+
+    # nothing notable beyond a bare model/close anchor -> no trace
+    if not (prompts or loop_sigs or edits or verifies or cfiles):
+        return None
+
+    dur_s = _secs(last_ts) if last_ts else max((e["_s"] for e in raw), default=0)
+    raw.append({"_s": dur_s, "kind": "close", "ended_on": last_actor or "agent",
+                "verify_after_last_edit": verify_after_last_edit,
+                "edits_total": sum(e["count"] for e in edits.values())})
+
+    raw.sort(key=lambda e: e["_s"])
+    events = []
+    for i, e in enumerate(raw):
+        ev = {k: v for k, v in e.items() if k != "_s"}
+        ev = {"id": i, "t": fmt_mmss(e["_s"]), **ev}
+        events.append(ev)
+    return {
+        "duration": fmt_mmss(dur_s),
+        "totals": {"prompts": len(prompts), "files_edited": len(edits),
+                   "edits": sum(e["count"] for e in edits.values()),
+                   "loops": sum(v["count"] - 1 for v in loop_sigs.values() if v["count"] > 1)},
+        "events": events,
+    }
 
 # ----------------------------------------------------------------------------
 # 4. (BYOK generation lives in cuebench_gen.Generator — one provider switch, off-if-no-key.
-#    insights are fed DERIVED NUMBERS ONLY; the TITLE (from the first prompt) and the TRACE
-#    (from the ordered session timeline — file names / commands / operator quotes) are
-#    content-aware opt-ins: their raw inputs go only to the user's own endpoint, and only the
-#    short generated text reaches the payload. trace is additionally double-gated by
-#    CUEBENCH_TRACE. The old helpers that echoed verbatim prompts into the payload were removed.)
+#    insights are fed DERIVED NUMBERS ONLY; the TRACE (a factual event menu from the whole
+#    session timeline — opening/steering prompts, tool loops, context build, edits, verify
+#    runs, model, close) is a content-aware opt-in: its raw inputs go only to the user's own
+#    endpoint, and only the short generated labels reach the payload. trace is double-gated by
+#    CUEBENCH_TRACE. The session TITLE and taskType are produced LOCALLY by cuebench_classify
+#    (no BYOK) — see build_payload. The old AI "content title" was removed.)
 # ----------------------------------------------------------------------------
-# (the three legacy raw-transcript helpers — generate_trace / _fallback_trace /
-#  make_task_title — were deleted. Their replacements in cuebench_gen are fed derived
-#  numbers only, so they cannot echo raw prompt text into the payload.)
 
 # ----------------------------------------------------------------------------
 # 5. Payload assembly + POST
@@ -416,13 +569,14 @@ def build_payload(parsed: dict, scorer: ModelScorer, store: Store, gen: Generato
     """Assemble the privacy-safe POST body. Returns (payload, gen_status) where gen_status is
     one of 'cache' | 'generated' | 'gen-failed' | 'off' — for logging/dry-run visibility.
 
-    The payload contains derived numbers + AI-generated text. Two fields are CONTENT-AWARE
-    when BYOK is on (both generated via the user's OWN endpoint; the raw inputs are never
-    posted): `title` (from the first prompt — see cuebench_gen.content_title; falls back to
-    the session's last-use date/time when generation is off) and, when CUEBENCH_TRACE is
-    enabled, `trace` (a coaching timeline grounded in real events — file names, commands,
-    operator quotes). insights and specificity (a 0-100 number) stay numbers-only. The
-    payload still carries no checklist, no verbatim transcript dump, and no repo path.
+    The payload contains derived numbers + local classification + (optional) BYOK text.
+    `title` (the operator's own first prompt, normalized locally — NOT generated),
+    `taskType`/`taskLabel` (local 18-way classification) and `specificity` (a 0-100 Description
+    cross-check, computed on-device via the local encoder) are always available and need no key.
+    When BYOK is on, `trace` (CUEBENCH_TRACE — a coaching timeline grounded in real events:
+    file names, commands, operator quotes) is the only CONTENT-AWARE generated field; its raw
+    inputs go only to the user's OWN endpoint and are never posted. insights stays numbers-only.
+    The payload still carries no checklist, no verbatim transcript dump, and no repo path.
 
     `quality` is the headline verdict (replaces the old letter grade): a confidence gate
     first (thin sessions -> "Insufficient signal", NOT placed on the scale), else one of 6
@@ -441,6 +595,19 @@ def build_payload(parsed: dict, scorer: ModelScorer, store: Store, gen: Generato
     # Headline verdict: confidence gate first (thin -> "Insufficient signal"), else a zone.
     quality = sig.quality(raw_composite, inputs)
 
+    # Task classification — 100% LOCAL, no BYOK. `task_title` is the operator's OWN first
+    # prompt, normalized (not an AI paraphrase); `task_type`/`task_label` come from the
+    # keyword rules + local-embedding fallback (cuebench_classify). This replaces the old
+    # BYOK "content title / AI rename": always on, costs no API calls, deterministic.
+    embedder = _get_embedder(scorer)
+    # doc_text lets the titler resolve an ordinal ref ("Milestone 0") to its real section name
+    # using the plan/spec the session read (recovered from the transcript; disk as fallback).
+    cls = classify_session(inputs, embedder=embedder, doc_text=_doc_context(parsed))
+    task_title, task_type, task_label = cls["title"], cls["taskType"], cls["label"]
+    # Description cross-check (prompt specificity) — now LOCAL via the same encoder. No OpenAI
+    # embeddings, no raw prompt text off-device. None when the encoder is unavailable.
+    specificity = embedder.specificity(parsed["prompts"]) if embedder is not None else None
+
     dur = parsed["duration_s"]
     sid = make_sid(parsed["session_uuid"])
 
@@ -450,47 +617,37 @@ def build_payload(parsed: dict, scorer: ModelScorer, store: Store, gen: Generato
                                       "loops", "n_commits", "churn", "survival_proxy", "reverts")}
     metrics["duration_seconds"] = dur
 
-    # Generation: reuse the cached, paid-for-once artifacts unless regenerate is forced.
+    # BYOK generation now produces ONLY insights / trace. Title, taskType and specificity are
+    # all LOCAL (computed above) and need no key. Generation reuses the cached, paid-for-once
+    # artifacts unless regenerate is forced.
     cached = None if regenerate else store.get_generation(sid)
     if cached:
-        title, insights, trace = cached["title"], cached["insights"], cached["trace"]
-        specificity = cached.get("specificity")
+        insights, trace = cached["insights"], cached["trace"]
         gen_status = "cache"
     elif gen.enabled:
-        # Content-aware title from the session's FIRST prompt (opt-in: see
-        # cuebench_gen.content_title). The raw prompt goes only to the user's own BYOK
-        # endpoint; only the short title is kept. insights/trace below stay numbers-only.
-        first_prompt = parsed["prompts"][0] if parsed["prompts"] else None
-        title = gen.content_title(first_prompt)
         # insights are numbers-only UNLESS prompt-informed mode is on (CUEBENCH_INSIGHTS_PROMPTS):
         # then gen.insights feeds these prompts to its own BYOK endpoint so coaching can
         # reference what was asked. The flag is checked inside insights(); passing prompts
         # unconditionally is safe — they're ignored when the opt-in is off.
         insights = gen.insights(metrics, vectors, quality, prompts=parsed["prompts"])
-        # Content-grounded coaching timeline, built from the ACTUAL transcript events and
-        # generated via the user's own BYOK endpoint (opt-in: double-gated by CUEBENCH_TRACE).
-        trace = None
-        if gen.trace_enabled:
-            timeline = build_timeline(parsed["path"], parsed["first_ts"])
-            header = {
-                "model": parsed["model"] or "unknown", "duration": fmt_mmss(dur),
-                "score": score, "n_prompts": metrics["n_prompts"],
-                "n_tools": metrics["n_tools"], "n_edits": metrics["n_edits"],
-                "loops": metrics["loops"], "n_commits": metrics["n_commits"],
-                "cost_tokens": parsed["input_tokens"] + parsed["output_tokens"],
-            }
-            trace = gen.trace(timeline, header, quality)
-        # specificity is the ONE input that sees raw prompt TEXT (opt-in, OpenAI-only). It is
-        # sent only to the user's own embeddings endpoint; just the 0-100 NUMBER is kept here.
-        specificity = gen.specificity(parsed["prompts"])
-        if title is not None:                    # provider reachable -> persist (paid once)
-            store.save_generation(sid, title, insights, trace, specificity, gen.provider,
+        # Trace = a factual, timestamped EVENT MENU from the whole session timeline
+        # (build_session_events: opening prompt, redirects, tool loops, context build, edits,
+        # verify runs, model, close). The model labels the notable events and references each
+        # by its integer id; the TIME on every entry is code-computed here and stamped by the
+        # generator from that id — the AI never sees or authors a timestamp, and can only point
+        # at an event we extracted (no fabrication).
+        trace = (gen.trace(build_session_events(parsed["path"], parsed["first_ts"], parsed["last_ts"]))
+                 if gen.trace_enabled else None)
+        # Provider reachable iff a BYOK product came back -> persist (paid once). specificity is
+        # local now, so it does NOT signal reachability; gate only on the BYOK outputs.
+        if insights is not None or trace is not None:
+            store.save_generation(sid, task_title, insights, trace, specificity, gen.provider,
                                   gen.model, parsed["n_lines"])
             gen_status = "generated"
         else:                                    # transient failure -> don't cache; retry next run
             gen_status = "gen-failed"
     else:
-        title, insights, trace, specificity = None, None, None, None
+        insights, trace = None, None
         gen_status = "off"
 
     total_tok = parsed["input_tokens"] + parsed["output_tokens"]
@@ -499,10 +656,14 @@ def build_payload(parsed: dict, scorer: ModelScorer, store: Store, gen: Generato
     payload = {
         "employeeId": EMPLOYEE_ID,
         "sessionId": sid,
-        # Content-aware title when BYOK is on; else a provider-supplied name (Cursor composers
-        # carry one — free and accurate); else the session's last-use date/time (no key -> no
-        # generated name, so label by WHEN it ran, not the opaque sessionId).
-        "title": title or parsed.get("title_hint") or fmt_date(parsed["last_ts"]),
+        # Title is the operator's OWN first prompt, normalized locally (cuebench_classify) —
+        # no BYOK, no AI paraphrase. Falls back to a provider-supplied name (Cursor composers
+        # carry one — free and accurate), else the session's last-use date/time.
+        "title": task_title or parsed.get("title_hint") or fmt_date(parsed["last_ts"]),
+        # Embedding-generated task classification (18-way), local + deterministic. `taskType`
+        # is the machine key (e.g. "bug_fix"); `taskLabel` the human label (e.g. "Bug fix").
+        "taskType": task_type,
+        "taskLabel": task_label,
         "model": parsed["model"] or "unknown",
         # Which CLI/tool produced the session. Each provider parser stamps it; "ext" is the
         # fallback for any source that doesn't (an unknown/external transcript).
@@ -738,10 +899,6 @@ def main():
     ap.add_argument("--state-db", default=STATE_DB, help="local generation-cache / dedup SQLite db")
     ap.add_argument("--trace", action="store_true",
                     help="also generate the optional neutral trace (off by default)")
-    ap.add_argument("--specificity", action="store_true",
-                    help="compute the prompt-specificity number via OpenAI embeddings "
-                         "(OpenAI BYOK only; sends raw prompt TEXT to your embeddings endpoint — "
-                         "off by default; only the 0-100 number is sent to the dashboard)")
     ap.add_argument("--regenerate", action="store_true",
                     help="ignore cached generation and regenerate (spends BYOK quota)")
     a = ap.parse_args()
@@ -751,9 +908,8 @@ def main():
     if seeded:
         print(f"[migrate] seeded {seeded} already-POSTed sessionId(s) from {SCORED_FILE}",
               file=sys.stderr)
-    # A flag forces the feature on; absent -> None -> the env default (CUEBENCH_TRACE / _SPECIFICITY).
-    gen = Generator(trace_enabled=(True if a.trace else None),
-                    specificity_enabled=(True if a.specificity else None))
+    # A flag forces the feature on; absent -> None -> the env default (CUEBENCH_TRACE).
+    gen = Generator(trace_enabled=(True if a.trace else None))
     print(f"[gen] {gen.status()}", file=sys.stderr)
 
     print(f"[load] model from {a.model} ...", file=sys.stderr)

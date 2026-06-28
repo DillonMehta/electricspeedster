@@ -44,40 +44,18 @@ def test_parse_recent_sessions_order_and_fields():
     assert posted["file"] == "bbb.jsonl"                      # transcript captured for AI rename
 
 
-def test_shorten_title():
-    assert m._shorten_title('"Add debounce to search"') == "Add debounce to search"   # quotes stripped
-    assert m._shorten_title("Refactor\nignored second line") == "Refactor"            # first line only
-    long = m._shorten_title("Add comprehensive retry and backoff to the upload pipeline", max_chars=32)
-    assert len(long) <= 32 and not long.endswith(" ") and " " in long                # word-boundary trim
-    assert m._shorten_title("Fix bug.") == "Fix bug"                                  # trailing punct trimmed
+# NOTE: the BYOK AI-rename helpers (_shorten_title, first_human_prompt, make_short_title,
+# set_title_override) were removed — titles are now generated locally in the scoring pipeline
+# (cuebench_classify), so there's no per-session AI rename to test here. A HAND-EDITED override
+# file is still honored, which the test below covers.
 
 
-def test_first_human_prompt(tmp_path):
+def test_title_override_applied_if_present(tmp_path, monkeypatch):
     import json
-    p = tmp_path / "s.jsonl"
-    lines = [
-        json.dumps({"type": "assistant", "message": {"role": "assistant", "content": []}}),
-        # a tool-result user turn (must be skipped)
-        json.dumps({"type": "user", "message": {"role": "user",
-                    "content": [{"type": "tool_result", "content": "x"}]}}),
-        # the real first prompt (with a system-reminder to strip)
-        json.dumps({"type": "user", "origin": {"kind": "human"}, "message": {"role": "user",
-                    "content": "Add a debounce <system-reminder>noise</system-reminder> to search"}}),
-        json.dumps({"type": "user", "origin": {"kind": "human"}, "message": {"role": "user",
-                    "content": "second prompt"}}),
-    ]
-    p.write_text("\n".join(lines))
-    res = m.first_human_prompt(str(p))
-    assert res.startswith("Add a debounce") and res.endswith("to search")  # first human prompt
-    assert "system-reminder" not in res and "noise" not in res             # reminder stripped
-    assert "second" not in res                                             # only the FIRST prompt
-    assert m.first_human_prompt(str(tmp_path / "missing.jsonl")) is None
-
-
-def test_title_override_roundtrip_and_applied(tmp_path, monkeypatch):
-    monkeypatch.setattr(m, "TITLE_OVERRIDES_PATH", str(tmp_path / "ov.json"))
+    ovf = tmp_path / "ov.json"
+    monkeypatch.setattr(m, "TITLE_OVERRIDES_PATH", str(ovf))
     assert m.read_title_overrides() == {}
-    m.set_title_override("S-DDDDDDDD", "My short name")
+    ovf.write_text(json.dumps({"S-DDDDDDDD": "My short name"}))     # user hand-edits the file
     assert m.read_title_overrides()["S-DDDDDDDD"] == "My short name"
 
     # recent_sessions should apply the override to the matching row's title
@@ -182,6 +160,21 @@ def test_env_truthy():
 def test_trace_is_a_managed_toggle():
     assert "CUEBENCH_TRACE" in d.MANAGED_ENV_KEYS                     # editable in Settings
     assert ("CUEBENCH_TRACE", "Session trace", "toggle") in m.SETTINGS_FIELDS
+
+
+def test_prompt_informed_insights_is_a_managed_toggle():
+    assert "CUEBENCH_INSIGHTS_PROMPTS" in d.MANAGED_ENV_KEYS          # editable in Settings
+    assert ("CUEBENCH_INSIGHTS_PROMPTS", "Prompt-informed insights", "toggle") in m.SETTINGS_FIELDS
+
+
+def test_each_toggle_has_its_own_hint():
+    # Regression: every toggle used to render the trace hint. Each toggle must have a
+    # distinct, defined helper string (no two toggles share one, none falls back to a label).
+    toggles = [(k, l) for (k, l, kind) in m.SETTINGS_FIELDS if kind == "toggle"]
+    hints = [m.TOGGLE_HINTS.get(k) for k, _ in toggles]
+    assert all(h for h in hints), "every toggle needs an explicit TOGGLE_HINTS entry"
+    assert len(set(hints)) == len(hints), "toggle hints must be distinct"
+    assert "prompt" in m.TOGGLE_HINTS["CUEBENCH_INSIGHTS_PROMPTS"].lower()   # not the trace text
 
 
 def test_mask_key():
