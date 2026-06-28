@@ -191,6 +191,7 @@ def parse_transcript(path: str) -> dict:
 
     return {
         "session_uuid": session_uuid,
+        "path": path,
         "prompts": prompts,
         "tool_cmds": tool_cmds,
         "n_tools": n_tools,
@@ -305,11 +306,96 @@ def fmt_date(ts: str | None) -> str:
     return f"{dt.strftime('%b')} {dt.day}, {dt.year}, {dt.strftime('%H:%M')}"
 
 # ----------------------------------------------------------------------------
+# 3b. Session timeline (CONTENT-bearing — built only when the trace is enabled).
+#     This is the one extraction that carries raw file names / commands / prompt
+#     text; it is fed ONLY to the user's own BYOK endpoint by cuebench_gen.trace
+#     (never POSTed raw). Skipped entirely on the default path (trace off).
+# ----------------------------------------------------------------------------
+# tool name -> the input key whose value is the salient, human-meaningful argument
+_TOOL_ARG_KEY = {
+    "Bash": "command", "Read": "file_path", "Edit": "file_path", "Write": "file_path",
+    "MultiEdit": "file_path", "NotebookEdit": "notebook_path",
+    "str_replace_based_edit_tool": "path", "Grep": "pattern", "Glob": "pattern",
+}
+
+def _tool_descriptor(name: str, inp: dict) -> str:
+    """One-line 'Tool: salient-arg' descriptor for a tool_use block (e.g.
+    'Bash: pytest tests/test_auth.py', 'Edit: session.py'). Truncated; newlines flattened."""
+    val = str((inp or {}).get(_TOOL_ARG_KEY.get(name, ""), "") or "")
+    if not val:                              # unknown tool -> first stringy arg, if any
+        for v in (inp or {}).values():
+            if isinstance(v, str) and v.strip():
+                val = v
+                break
+    val = " ".join(val.split())
+    return f"{name}: {val[:140]}" if val else (name or "tool")
+
+def build_timeline(path: str, first_ts, *, max_tool_events: int = 120,
+                   max_prompts: int = 40) -> dict:
+    """Ordered list of session events with elapsed MM:SS timestamps and turn numbers,
+    for the content-grounded trace. Each event: {turn, t, kind, text}. Keeps every operator
+    prompt (high value, few) and the tool/edit sequence; on a long session keeps the start
+    and end of the tool sequence and records how many middle events were omitted. Bounded
+    so a huge transcript can't blow up memory or BYOK cost."""
+    base = _parse_ts(first_ts)
+    prompts, tools, seq, turn = [], [], 0, 0
+    try:
+        with open(path, "r", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                ts = _parse_ts(rec.get("timestamp"))
+                t = fmt_mmss(int((ts - base).total_seconds())) if (ts and base) else "00:00"
+                typ = rec.get("type")
+                if typ == "user" and _is_human_prompt(rec):
+                    turn += 1
+                    txt = _clean_prompt(_text_from_content((rec.get("message") or {}).get("content")))
+                    if txt:
+                        prompts.append({"i": seq, "turn": turn, "t": t,
+                                        "kind": "prompt", "text": txt[:240]})
+                        seq += 1
+                elif typ == "assistant":
+                    for b in ((rec.get("message") or {}).get("content") or []):
+                        if not isinstance(b, dict) or b.get("type") != "tool_use":
+                            continue
+                        name, inp = b.get("name", ""), (b.get("input") or {})
+                        desc = _tool_descriptor(name, inp)
+                        if name in EDIT_TOOLS:
+                            n = _written_lines(name, inp)
+                            ev = {"i": seq, "turn": turn, "t": t, "kind": "edit",
+                                  "text": f"{desc} (+{n} lines)" if n else desc}
+                        else:
+                            ev = {"i": seq, "turn": turn, "t": t, "kind": "tool", "text": desc}
+                        tools.append(ev)
+                        seq += 1
+    except Exception:
+        return {"events": [], "tool_events_omitted": 0}
+
+    prompts = prompts[:max_prompts]
+    omitted = 0
+    if len(tools) > max_tool_events:                 # keep the start AND the end of a long run
+        head = int(max_tool_events * 0.7)
+        kept = tools[:head] + tools[-(max_tool_events - head):]
+        omitted = len(tools) - max_tool_events
+    else:
+        kept = tools
+    events = sorted(prompts + kept, key=lambda e: e["i"])
+    for e in events:
+        e.pop("i", None)
+    return {"events": events, "tool_events_omitted": omitted}
+
+# ----------------------------------------------------------------------------
 # 4. (BYOK generation lives in cuebench_gen.Generator — one provider switch, off-if-no-key.
-#    insights/trace are fed DERIVED NUMBERS ONLY; the TITLE is content-aware (generated from
-#    the first prompt via content_title — the opt-in weakening, raw prompt sent only to the
-#    user's own endpoint and never entering the payload). The old raw-transcript helpers that
-#    echoed verbatim prompts into the payload were removed.)
+#    insights are fed DERIVED NUMBERS ONLY; the TITLE (from the first prompt) and the TRACE
+#    (from the ordered session timeline — file names / commands / operator quotes) are
+#    content-aware opt-ins: their raw inputs go only to the user's own endpoint, and only the
+#    short generated text reaches the payload. trace is additionally double-gated by
+#    CUEBENCH_TRACE. The old helpers that echoed verbatim prompts into the payload were removed.)
 # ----------------------------------------------------------------------------
 # (the three legacy raw-transcript helpers — generate_trace / _fallback_trace /
 #  make_task_title — were deleted. Their replacements in cuebench_gen are fed derived
@@ -329,12 +415,13 @@ def build_payload(parsed: dict, scorer: ModelScorer, store: Store, gen: Generato
     """Assemble the privacy-safe POST body. Returns (payload, gen_status) where gen_status is
     one of 'cache' | 'generated' | 'gen-failed' | 'off' — for logging/dry-run visibility.
 
-    The payload contains derived numbers + AI-generated text. `title` is CONTENT-AWARE when
-    BYOK is on (generated from the first prompt via the user's OWN endpoint — see
-    cuebench_gen.content_title; the raw prompt itself is never posted) and falls back to the
-    session's last-use date/time when generation is off. insights, trace, and specificity
-    (a 0-100 number) stay numbers-only. Still NO checklist, no verbatim task/first-prompt, no
-    digest preview, no repo path — nothing beyond the short title can carry raw content.
+    The payload contains derived numbers + AI-generated text. Two fields are CONTENT-AWARE
+    when BYOK is on (both generated via the user's OWN endpoint; the raw inputs are never
+    posted): `title` (from the first prompt — see cuebench_gen.content_title; falls back to
+    the session's last-use date/time when generation is off) and, when CUEBENCH_TRACE is
+    enabled, `trace` (a coaching timeline grounded in real events — file names, commands,
+    operator quotes). insights and specificity (a 0-100 number) stay numbers-only. The
+    payload still carries no checklist, no verbatim transcript dump, and no repo path.
 
     `quality` is the headline verdict (replaces the old letter grade): a confidence gate
     first (thin sessions -> "Insufficient signal", NOT placed on the scale), else one of 6
@@ -395,9 +482,10 @@ def build_payload(parsed: dict, scorer: ModelScorer, store: Store, gen: Generato
     payload = {
         "employeeId": EMPLOYEE_ID,
         "sessionId": sid,
-        # Content-aware title when BYOK is on; otherwise the session's last-use date/time
-        # (no key -> no generated name, so label by WHEN it ran, not the opaque sessionId).
-        "title": title or fmt_date(parsed["last_ts"]),
+        # Content-aware title when BYOK is on; else a provider-supplied name (Cursor composers
+        # carry one — free and accurate); else the session's last-use date/time (no key -> no
+        # generated name, so label by WHEN it ran, not the opaque sessionId).
+        "title": title or parsed.get("title_hint") or fmt_date(parsed["last_ts"]),
         "model": parsed["model"] or "unknown",
         "date": fmt_date(parsed["last_ts"]),      # v1 schema: human-readable date
         "duration": fmt_duration(dur),
@@ -491,6 +579,15 @@ def parse_session(path: str) -> dict:
 
 def process_one(path: str, scorer: ModelScorer, store: Store, gen: Generator,
                 *, dry_run: bool = False, regenerate: bool = False) -> tuple[str, str | None]:
+    """Parse a transcript FILE (Claude or Codex) and score/dedup/POST it. Thin wrapper over
+    process_parsed so non-file providers (e.g. Cursor's SQLite composers) share the exact same
+    dedup + score + POST core."""
+    return process_parsed(parse_session(path), scorer, store, gen, dry_run=dry_run,
+                          regenerate=regenerate, source=os.path.basename(path))
+
+def process_parsed(parsed: dict, scorer: ModelScorer, store: Store, gen: Generator,
+                   *, dry_run: bool = False, regenerate: bool = False,
+                   source: str = "") -> tuple[str, str | None]:
     """Returns (status, sid). status in {'posted','dup','skip','fail'}:
       posted = scored & accepted (or dry-run printed); dup = already sent and unchanged;
       skip = nothing to score (don't retry); fail = transient POST failure (retry later).
@@ -498,10 +595,10 @@ def process_one(path: str, scorer: ModelScorer, store: Store, gen: Generator,
     Dedup + append handling key on the stable sessionId: a session with MORE turns than when
     last sent is re-sent as an UPDATE (the dashboard upserts on sessionId); an unchanged
     already-sent session is skipped. A failed POST is NOT marked sent (so it retries) and does
-    NOT regenerate (the cached generation is reused)."""
-    parsed = parse_session(path)      # Claude OR Codex — same dict shape either way
+    NOT regenerate (the cached generation is reused). Provider-agnostic: `parsed` is the dict
+    shape parse_transcript / parse_codex_transcript / parse_cursor_composer all return."""
     if not parsed["prompts"]:
-        print(f"  [skip] {os.path.basename(path)}: no operator prompts found")
+        print(f"  [skip] {source or parsed.get('session_uuid', '?')}: no operator prompts found")
         return "skip", None
     sid = make_sid(parsed["session_uuid"])
 

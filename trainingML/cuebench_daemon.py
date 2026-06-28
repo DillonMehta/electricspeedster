@@ -273,6 +273,51 @@ def read_status() -> dict | None:
         return None
 
 
+def scan_cursor_once(agent, scorer, store, gen, *, dry_run, state, stable_seconds):
+    """Scan Cursor composers once and score/POST the finished, changed ones. Cursor isn't a
+    file source, so we mirror the file watcher's stable-detection on `lastUpdatedAt`: a composer
+    is processed only after its timestamp has been unchanged for `stable_seconds` (so we never
+    score one mid-run), once per stable point. Dedup/append/POST are handled by
+    agent.process_parsed (keyed on the stable sessionId), exactly like Claude/Codex files.
+
+    state = {"seen": {cid: (last_updated, first_seen_at)}, "handled": set(cid)}.
+    """
+    try:
+        import cuebench_cursor as cur
+        import time as _t
+    except Exception:
+        return
+    now = _t.time()
+    try:
+        comps = cur.list_cursor_composers()
+    except Exception:
+        return
+    for comp in comps:
+        cid = comp.get("composer_id")
+        lu = comp.get("last_updated") or 0
+        if not cid or (comp.get("n_bubbles") or 0) <= 0:
+            continue
+        prev = state["seen"].get(cid)
+        if prev is None or prev[0] != lu:
+            state["seen"][cid] = (lu, now)        # new/changed -> reset the stability clock
+            state["handled"].discard(cid)         # growth re-opens it (append -> UPDATE)
+            continue
+        if now - prev[1] < stable_seconds or cid in state["handled"]:
+            continue
+        print(f"[finished] cursor:{comp.get('name') or cid}", flush=True)
+        try:
+            parsed = cur.parse_cursor_composer(cid)
+            status, _ = agent.process_parsed(parsed, scorer, store, gen, dry_run=dry_run,
+                                             source=f"cursor:{cid[:8]}")
+        except Exception as e:
+            print(f"  [error] cursor {cid}: {e!r}", file=sys.stderr, flush=True)
+            status = "skip"
+        if status in ("posted", "dup", "skip"):
+            state["handled"].add(cid)
+        else:
+            state["seen"][cid] = (lu, now)        # transient POST failure -> retry next pass
+
+
 # ============================================================================
 # The foreground loop launchd executes (also runnable by hand for testing).
 # ============================================================================
@@ -325,10 +370,21 @@ def cmd_run(args) -> int:
     projects = os.environ["CUEBENCH_PROJECTS_DIR"]
     codex = os.environ.get("CUEBENCH_CODEX_DIR", "")
     roots = [projects] + ([codex] if codex and os.path.isdir(codex) else [])
-    watching = "; ".join(roots)
+    # Cursor lives in a SQLite KV store (not files); it's scanned separately each cycle.
+    cursor_db = os.environ.get("CUEBENCH_CURSOR_DB", "")
+    if not cursor_db:
+        try:
+            import cuebench_cursor as _cc
+            cursor_db = _cc.DEFAULT_CURSOR_DB
+        except Exception:
+            cursor_db = ""
+    cursor_on = bool(cursor_db and os.path.exists(cursor_db))
+    watching = "; ".join(roots) + ("  + Cursor" if cursor_on else "")
     print(f"[daemon] starting  mode={mode}  pid={os.getpid()}  "
           f"time={time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
     print(f"[daemon] watching  {watching}  (READ-ONLY)", flush=True)
+    if cursor_on:
+        print(f"[daemon] cursor    {cursor_db}", flush=True)
     if codex and not os.path.isdir(codex):
         print(f"[daemon] (codex dir {codex} not present yet — will pick it up if created "
               "after restart)", flush=True)
@@ -364,12 +420,17 @@ def cmd_run(args) -> int:
         return 3
     print(f"[daemon] model loaded (weights={scorer.loaded_from}); entering watch loop", flush=True)
 
-    # Heartbeat closure: bump a cycle counter and write status each completed scan pass.
+    # Heartbeat closure: bump a cycle counter, write status, and (since Cursor isn't a file
+    # source) scan Cursor composers each scan pass.
     state = {"cycles": 0}
+    cursor_state = {"seen": {}, "handled": set()}
 
     def _heartbeat():
         state["cycles"] += 1
         write_status(mode, state["cycles"], agent.POLL_INTERVAL, watching, processed=0)
+        if cursor_on:
+            scan_cursor_once(agent, scorer, store, gen, dry_run=dry_run,
+                             state=cursor_state, stable_seconds=agent.STABLE_SECONDS)
 
     write_status(mode, 0, agent.POLL_INTERVAL, watching, processed=0)
     # Reuse the EXACT existing loop (stable-size detection, dedup, retry-later) — only the
