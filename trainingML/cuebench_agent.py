@@ -678,7 +678,7 @@ def build_payload(parsed: dict, scorer: ModelScorer, store: Store, gen: Generato
     # out so a long flailing session can score low. Centered -> avg session unchanged. See
     # cuebench_calibrate. (Stopgap until the model is retrained with rate-based features.)
     vectors = calib.decorrelate(vectors, sig.n_effective(inputs))
-    raw_composite = sum(vectors.values()) / 4.0
+    raw_composite = sig.composite(vectors)       # WEIGHTED mean (driving-skill heavier), not even
     score = round(raw_composite)
     # Headline verdict: confidence gate first (thin -> "Insufficient signal"), else a zone.
     quality = sig.quality(raw_composite, inputs)

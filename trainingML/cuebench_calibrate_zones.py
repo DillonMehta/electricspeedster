@@ -83,6 +83,8 @@ def main():
         sys.exit(f"no data matched {a.data}")
 
     from model_infer import ModelScorer
+    import cuebench_signals as sig
+    import cuebench_calibrate as calib
     scorer = ModelScorer(a.model)
     print(f"[calibrate] model loaded from {scorer.loaded_from}; files={paths}", file=sys.stderr)
 
@@ -102,7 +104,8 @@ def main():
             if sup is None:
                 continue
             vectors = scorer.score(text)
-            raw = sum(vectors.values()) / 4.0
+            vectors = calib.decorrelate(vectors, sup)   # mirror production: calibrate, then
+            raw = sig.composite(vectors)                # WEIGHTED composite (not even mean)
             rows.append((rec.get("sid", ""), sup, raw))
             n_seen += 1
             if n_seen % 500 == 0:

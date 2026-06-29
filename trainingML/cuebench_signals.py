@@ -162,6 +162,34 @@ def digest_text(inputs: dict, max_prompt_chars: int = 4000) -> str:
     return head + "\nPROMPTS:" + "".join(prompts)
 
 # ============================================================================
+# 4b. COMPOSITE  — the headline 0-100 score is a WEIGHTED mean of the four axes,
+#     NOT an even average. "Driving skill heavier": delegation + description (how
+#     well the operator SCOPED and SPECIFIED the work) carry more than discernment
+#     and diligence. Single source of truth — build_payload and the zone calibrator
+#     both call composite() so the score and its calibration never diverge.
+# ============================================================================
+AXIS_WEIGHTS = {                   # relative weights; normalized over present axes in composite()
+    "delegation": 0.30,
+    "description": 0.30,
+    "discernment": 0.20,
+    "diligence": 0.20,
+}
+
+def composite(vectors: dict) -> float:
+    """Weighted mean (0-100) of the axis scores using AXIS_WEIGHTS. Weights are renormalized
+    over the axes ACTUALLY present, so a missing axis doesn't silently deflate the score. If no
+    weighted axis is present, falls back to an even mean over whatever is there."""
+    num = den = 0.0
+    for ax, v in vectors.items():
+        w = AXIS_WEIGHTS.get(ax)
+        if w is not None:
+            num += w * float(v)
+            den += w
+    if den > 0:
+        return num / den
+    return sum(float(v) for v in vectors.values()) / len(vectors) if vectors else 0.0
+
+# ============================================================================
 # 5. SPECIFICITY  (Description cross-check) — MOVED to cuebench_classify.
 #    Specificity is now computed LOCALLY via the on-device encoder
 #    (EmbeddingTypeClassifier.specificity) — no external embeddings API, no raw prompt text
@@ -236,19 +264,24 @@ def derive_checklist(inputs: dict, vectors: dict) -> dict:
 THIN_SESSION_MIN_SUPPORT = 11      # support (prompts+tools) below this -> Insufficient signal
                                    # (v1: ~p10 of the corpus; gates ~9% of sessions)
 
-# Empirical-Bayes shrinkage of the 0-100 composite toward the population prior
-EB_PRIOR_MEAN     = 58.8           # mean raw composite over substantive sessions (shrink target)
+# Empirical-Bayes shrinkage of the 0-100 composite toward the population prior.
+# NOTE: prior + zone bounds below were RE-CALIBRATED (cuebench_calibrate_zones.py) on the
+# WEIGHTED composite (sig.composite, driving-skill heavier) AFTER the length-bias correction
+# (cuebench_calibrate) — both shift/compress the distribution, so the even-average v1 bounds
+# no longer fit. Re-run the calibrator whenever the weights, calibration, or model change.
+EB_PRIOR_MEAN     = 59.4           # mean weighted+calibrated composite over substantive sessions
 EB_PRIOR_STRENGTH = 11.0           # K: pseudo-observations of prior weight. support>>K -> ~raw;
                                    # support==K -> halfway to prior. Tied to the gate by design.
 
 # Lower bounds (on the EB-shrunk, rounded composite) separating the 6 zones.
 # Ascending; a score in [MAX_below, MAX_at) lands in the zone named by the upper const.
-ZONE_CRITICAL_MAX         = 38     # eb_score <  38            -> 6 Critical        (URGENT)
-ZONE_NEEDS_ATTENTION_MAX  = 46     # 38 <= eb_score < 46       -> 5 Needs attention (URGENT)
-ZONE_INCONSISTENT_MAX     = 56     # 46 <= eb_score < 56       -> 4 Inconsistent
-ZONE_DEVELOPING_MAX       = 65     # 56 <= eb_score < 65       -> 3 Developing
-ZONE_SOLID_MAX            = 80     # 65 <= eb_score < 80       -> 2 Solid
-#                                    eb_score >= 80            -> 1 Dialed in
+# (Recalibrated on the weighted+length-corrected distribution; urgent tier ~9.8% of substantive.)
+ZONE_CRITICAL_MAX         = 40     # eb_score <  40            -> 6 Critical        (URGENT)
+ZONE_NEEDS_ATTENTION_MAX  = 48     # 40 <= eb_score < 48       -> 5 Needs attention (URGENT)
+ZONE_INCONSISTENT_MAX     = 58     # 48 <= eb_score < 58       -> 4 Inconsistent
+ZONE_DEVELOPING_MAX       = 62     # 58 <= eb_score < 62       -> 3 Developing
+ZONE_SOLID_MAX            = 68     # 62 <= eb_score < 68       -> 2 Solid
+#                                    eb_score >= 68            -> 1 Dialed in
 
 INSUFFICIENT_SIGNAL = "Insufficient signal"   # the gated state's label (NOT a zone)
 
