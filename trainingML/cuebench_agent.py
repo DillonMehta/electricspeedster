@@ -679,23 +679,27 @@ def build_payload(parsed: dict, scorer: ModelScorer, store: Store, gen: Generato
     # cuebench_calibrate. (Stopgap until the model is retrained with rate-based features.)
     vectors = calib.decorrelate(vectors, sig.n_effective(inputs))   # length-bias correction
     vectors = calib.recenter(vectors)            # global -6 level recentering (judge runs generous)
-    raw_composite = sig.composite(vectors)       # WEIGHTED mean (driving-skill heavier), not even
+
+    # Description axis = BLEND of the model's description score with prompt SPECIFICITY — a direct
+    # 0-100 measure of how specific the operator's prompts were, computed LOCALLY via the on-device
+    # encoder (no BYOK, no raw prompt text off-device). 60/40 (sig.blend_description). Done BEFORE
+    # compositing so the blended value flows into both the weighted score AND the displayed vector.
+    embedder = _get_embedder(scorer)
+    specificity = embedder.specificity(parsed["prompts"]) if embedder is not None else None
+    vectors["description"] = sig.blend_description(vectors["description"], specificity)
+
+    raw_composite = sig.composite(vectors)       # WEIGHTED (diligence + discernment heaviest)
     score = round(raw_composite)
     # Headline verdict: confidence gate first (thin -> "Insufficient signal"), else a zone.
     quality = sig.quality(raw_composite, inputs)
 
     # Task classification — 100% LOCAL, no BYOK. `task_title` is the operator's OWN first
-    # prompt, normalized (not an AI paraphrase); `task_type`/`task_label` come from the
-    # keyword rules + local-embedding fallback (cuebench_classify). This replaces the old
-    # BYOK "content title / AI rename": always on, costs no API calls, deterministic.
-    embedder = _get_embedder(scorer)
+    # prompt, normalized (not an AI paraphrase); `task_type`/`task_label` come from the keyword
+    # rules + local-embedding fallback (cuebench_classify). Reuses the encoder fetched above.
     # doc_text lets the titler resolve an ordinal ref ("Milestone 0") to its real section name
     # using the plan/spec the session read (recovered from the transcript; disk as fallback).
     cls = classify_session(inputs, embedder=embedder, doc_text=_doc_context(parsed))
     task_title, task_type, task_label = cls["title"], cls["taskType"], cls["label"]
-    # Description cross-check (prompt specificity) — now LOCAL via the same encoder. No OpenAI
-    # embeddings, no raw prompt text off-device. None when the encoder is unavailable.
-    specificity = embedder.specificity(parsed["prompts"]) if embedder is not None else None
 
     dur = parsed["duration_s"]
     sid = make_sid(parsed["session_uuid"])

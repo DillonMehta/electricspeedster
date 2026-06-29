@@ -163,16 +163,16 @@ def digest_text(inputs: dict, max_prompt_chars: int = 4000) -> str:
 
 # ============================================================================
 # 4b. COMPOSITE  — the headline 0-100 score is a WEIGHTED mean of the four axes,
-#     NOT an even average. "Driving skill heavier": delegation + description (how
-#     well the operator SCOPED and SPECIFIED the work) carry more than discernment
-#     and diligence. Single source of truth — build_payload and the zone calibrator
+#     NOT an even average. Diligence + discernment (did they VERIFY and use sound
+#     JUDGMENT — the outcome axes) carry more than delegation + description (the
+#     input axes). Single source of truth — build_payload and the zone calibrator
 #     both call composite() so the score and its calibration never diverge.
 # ============================================================================
 AXIS_WEIGHTS = {                   # relative weights; normalized over present axes in composite()
-    "delegation": 0.30,
-    "description": 0.30,
-    "discernment": 0.20,
-    "diligence": 0.20,
+    "delegation": 0.20,
+    "description": 0.20,
+    "discernment": 0.30,
+    "diligence": 0.30,
 }
 
 def composite(vectors: dict) -> float:
@@ -188,6 +188,21 @@ def composite(vectors: dict) -> float:
     if den > 0:
         return num / den
     return sum(float(v) for v in vectors.values()) / len(vectors) if vectors else 0.0
+
+
+# The DESCRIPTION axis is a blend of the model's description score and a direct, local 0-100
+# measure of prompt SPECIFICITY (cuebench_classify.EmbeddingTypeClassifier.specificity).
+DESCRIPTION_SPECIFICITY_WEIGHT = 0.6   # weight on the model's description; specificity gets the rest
+
+def blend_description(description, specificity) -> int:
+    """Final Description axis = description*0.6 + specificity*0.4 (0-100). The model judges how
+    well prompts communicated; specificity measures how SPECIFIC they were — blending both makes
+    the axis less dependent on the model alone. Returns description unchanged when specificity is
+    None (encoder unavailable)."""
+    if specificity is None:
+        return int(round(float(description)))
+    w = DESCRIPTION_SPECIFICITY_WEIGHT
+    return int(round(w * float(description) + (1.0 - w) * float(specificity)))
 
 # ============================================================================
 # 5. SPECIFICITY  (Description cross-check) — MOVED to cuebench_classify.
@@ -269,19 +284,21 @@ THIN_SESSION_MIN_SUPPORT = 11      # support (prompts+tools) below this -> Insuf
 # WEIGHTED composite (sig.composite, driving-skill heavier) AFTER the length-bias correction
 # (cuebench_calibrate) — both shift/compress the distribution, so the even-average v1 bounds
 # no longer fit. Re-run the calibrator whenever the weights, calibration, or model change.
-EB_PRIOR_MEAN     = 53.4           # mean weighted+calibrated composite (incl. -6 recentering)
+EB_PRIOR_MEAN     = 50.0           # mean composite under outcome-heavy weights + desc/spec blend
 EB_PRIOR_STRENGTH = 11.0           # K: pseudo-observations of prior weight. support>>K -> ~raw;
                                    # support==K -> halfway to prior. Tied to the gate by design.
 
 # Lower bounds (on the EB-shrunk, rounded composite) separating the 6 zones.
 # Ascending; a score in [MAX_below, MAX_at) lands in the zone named by the upper const.
-# (Recalibrated on the weighted+length-corrected distribution; urgent tier ~9.8% of substantive.)
-ZONE_CRITICAL_MAX         = 40     # eb_score <  40            -> 6 Critical        (URGENT)
-ZONE_NEEDS_ATTENTION_MAX  = 48     # 40 <= eb_score < 48       -> 5 Needs attention (URGENT)
-ZONE_INCONSISTENT_MAX     = 58     # 48 <= eb_score < 58       -> 4 Inconsistent
-ZONE_DEVELOPING_MAX       = 62     # 58 <= eb_score < 62       -> 3 Developing
-ZONE_SOLID_MAX            = 68     # 62 <= eb_score < 68       -> 2 Solid
-#                                    eb_score >= 68            -> 1 Dialed in
+# Recalibrated for the outcome-heavy weights (diligence/discernment 0.30) + the description/
+# specificity blend + the -6 recentering — that distribution centers ~50, so the bounds dropped
+# accordingly (a "Dialed in" session now reads ~60+, not ~80). Urgent tier ~10.1% of substantive.
+ZONE_CRITICAL_MAX         = 31     # eb_score <  31            -> 6 Critical        (URGENT)
+ZONE_NEEDS_ATTENTION_MAX  = 38     # 31 <= eb_score < 38       -> 5 Needs attention (URGENT)
+ZONE_INCONSISTENT_MAX     = 46     # 38 <= eb_score < 46       -> 4 Inconsistent
+ZONE_DEVELOPING_MAX       = 52     # 46 <= eb_score < 52       -> 3 Developing
+ZONE_SOLID_MAX            = 60     # 52 <= eb_score < 60       -> 2 Solid
+#                                    eb_score >= 60            -> 1 Dialed in
 
 INSUFFICIENT_SIGNAL = "Insufficient signal"   # the gated state's label (NOT a zone)
 

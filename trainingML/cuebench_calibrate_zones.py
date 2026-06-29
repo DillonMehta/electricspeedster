@@ -35,6 +35,19 @@ def support_from_text(text: str) -> int | None:
     return int(m.group(1)) + int(m.group(2))
 
 
+_PROMPTS_RE = re.compile(r"\s*\[P\d+\]\s*")
+
+
+def prompts_from_text(text: str) -> list:
+    """Recover the operator prompts from a digest's 'PROMPTS:' tail (so the calibrator can
+    compute the same specificity blend production does). Truncated like the digest, but close
+    enough for population calibration."""
+    tail = (text or "").split("\nPROMPTS:", 1)
+    if len(tail) < 2:
+        return []
+    return [p for p in _PROMPTS_RE.split(tail[1]) if p.strip()]
+
+
 def percentiles(xs, ps):
     xs = sorted(xs)
     out = {}
@@ -85,7 +98,14 @@ def main():
     from model_infer import ModelScorer
     import cuebench_signals as sig
     import cuebench_calibrate as calib
+    from cuebench_classify import EmbeddingTypeClassifier
     scorer = ModelScorer(a.model)
+    try:
+        embedder = EmbeddingTypeClassifier.from_scorer(scorer)   # local specificity (mirror prod)
+    except Exception as e:
+        embedder = None
+        print(f"[calibrate] specificity encoder unavailable ({e!r}); description blend skipped",
+              file=sys.stderr)
     print(f"[calibrate] model loaded from {scorer.loaded_from}; files={paths}", file=sys.stderr)
 
     rows = []  # (sid, support, raw_composite)
@@ -106,6 +126,8 @@ def main():
             vectors = scorer.score(text)
             vectors = calib.decorrelate(vectors, sup)   # mirror production: length-correct,
             vectors = calib.recenter(vectors)           # global level recenter,
+            spec = embedder.specificity(prompts_from_text(text)) if embedder is not None else None
+            vectors["description"] = sig.blend_description(vectors["description"], spec)  # 60/40
             raw = sig.composite(vectors)                # then WEIGHTED composite (not even mean)
             rows.append((rec.get("sid", ""), sup, raw))
             n_seen += 1
