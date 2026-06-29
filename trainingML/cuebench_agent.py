@@ -26,11 +26,12 @@ Secrets are read from env ONLY (never hardcoded). Missing keys degrade gracefull
 See AGENT_README.md for env vars and JSONL-format assumptions.
 """
 from __future__ import annotations
-import argparse, json, os, re, sys, time, glob
+import argparse, bisect, json, os, re, sys, time, glob
 from datetime import datetime, timezone
 from urllib import request as urlrequest, error as urlerror
 
 import cuebench_signals as sig
+import cuebench_calibrate as calib       # v1 length-bias decorrelation (applied to model output)
 from model_infer import ModelScorer
 from train_cuebench import AXES  # ["delegation","description","discernment","diligence"]
 from cuebench_gen import Generator        # one provider-switched generation module
@@ -87,16 +88,50 @@ def _doc_context(parsed: dict, max_chars: int = 80000) -> str | None:
                             parts.append(t); total += len(t)
         except Exception:
             pass
-    repo = parsed.get("cwd")                              # disk fallback: referenced .md still on disk
-    if total < max_chars and repo and os.path.isdir(repo):
-        refs = list({os.path.basename(r) for r in re.findall(r"[\w./-]+\.md\b", first, re.I)})[:3]
-        for ref in refs:
-            for cand in glob.glob(os.path.join(repo, "**", ref), recursive=True)[:1]:
-                try:
-                    parts.append(open(cand, errors="replace").read(max_chars))
-                except Exception:
-                    pass
+    # Disk fallback — ONLY when the transcript yielded nothing (total==0). Even then, a BOUNDED
+    # walk, NEVER glob('**', recursive=True): the session's cwd is often a huge tree (here it was
+    # the HOME dir), and the recursive glob walked all of anaconda/.pyenv/Library/node_modules/
+    # symlinks and spun for minutes — the hang that stalled the daemon and blocked the POST queue.
+    repo = parsed.get("cwd")
+    if total == 0 and repo and os.path.isdir(repo):
+        refs = {os.path.basename(r) for r in re.findall(r"[\w./-]+\.md\b", first, re.I)}
+        cand = _find_doc_file(repo, refs) if refs else None
+        if cand:
+            try:
+                parts.append(open(cand, errors="replace").read(max_chars))
+            except Exception:
+                pass
     return "\n".join(parts) if parts else None
+
+# Heavy/uninteresting dirs pruned from the bounded doc-file search (never hold a hand-authored
+# plan/spec .md, but can each contain hundreds of thousands of files).
+_DOC_SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "env", "__pycache__", "site-packages",
+                  ".pyenv", "anaconda3", "miniconda3", "Library", ".cache", "dist", "build",
+                  ".next", ".mypy_cache", ".pytest_cache", ".tox", "target", ".idea", ".vscode"}
+
+def _find_doc_file(repo: str, names: set, *, max_dirs: int = 1500, max_depth: int = 6) -> str | None:
+    """First file under `repo` whose basename is in `names`, via a BOUNDED os.walk (no symlinks,
+    heavy/hidden dirs pruned, capped dir count + depth). Replaces a recursive glob('**') that
+    could spin for minutes on a large cwd (e.g. the home dir). Returns a path or None; never raises."""
+    if not names:
+        return None
+    try:
+        base_depth = repo.rstrip(os.sep).count(os.sep)
+        seen = 0
+        for root, dirs, files in os.walk(repo, followlinks=False):
+            for n in names:
+                if n in files:
+                    return os.path.join(root, n)
+            seen += 1
+            if seen >= max_dirs:
+                return None
+            if root.count(os.sep) - base_depth >= max_depth:
+                dirs[:] = []                              # depth budget hit -> don't descend
+            else:                                         # prune heavy + hidden subtrees
+                dirs[:] = [d for d in dirs if d not in _DOC_SKIP_DIRS and not d.startswith(".")]
+    except Exception:
+        pass
+    return None
 
 # ----------------------------------------------------------------------------
 # Config (env only)
@@ -315,7 +350,9 @@ def duration_seconds(first_ts, last_ts) -> int:
         return max(0, int((b - a).total_seconds()))
     return 0
 
-_IDLE_CAP_S = 300   # a gap longer than this is "away", not "working"
+_IDLE_CAP_S = 300        # a gap longer than this is "away", not "working"
+_TRACE_GAP_MIN_S = 900   # a >=15min gap is surfaced as a "downtime" event in the trace
+_TRACE_GAP_BIG_S = 3600  # a >=1h gap is GUARANTEED an entry (cuebench_gen injects it if dropped)
 
 def active_duration(timestamps: list, idle_cap: int = _IDLE_CAP_S) -> int:
     """ACTIVE session seconds: Σ over consecutive events of min(gap, idle_cap).
@@ -377,12 +414,17 @@ def fmt_date(ts: str | None) -> str:
 #     FACTUAL, TIMESTAMPED "event menu": the opening prompt, later prompts (redirects),
 #     tool loops (target + count + turn range), the context build (files read before the
 #     first edit), per-file edits, verification runs, the model, and how the session
-#     closed. Every event carries:
+#     closed — plus DOWNTIME events for long idle gaps. Every event carries:
 #       • a code-computed elapsed time `t` (MM:SS) — the SOURCE OF TRUTH. The model never
 #         sees or authors a timestamp; it references an event by its integer `id` and the
 #         caller (cuebench_gen.trace) stamps t[id] onto each returned entry.
 #       • an integer `id`, so a generated entry can ONLY point at an event we actually
 #         extracted — the model cannot fabricate a moment that did not happen.
+#     TIMES ARE ACTIVE WORKING TIME, not wall clock: each event's `t` is the cumulative
+#     idle-capped elapsed time to that point (same convention as active_duration), so a
+#     session left open across a 6h break is NOT read as 6h of work. Each long idle gap
+#     (>= _TRACE_GAP_MIN_S) is ALSO emitted as a "downtime" event carrying the real wall-clock
+#     gap, so the break is visible instead of silently collapsed.
 #     Raw content (prompt text, file basenames, commands) goes ONLY to the user's own BYOK
 #     endpoint; only the short generated labels reach the POSTed payload, and only when
 #     CUEBENCH_TRACE is set. Skipped entirely on the default path (trace off). File targets
@@ -412,19 +454,24 @@ def build_session_events(path: str, first_ts, last_ts=None, *, max_prompts: int 
     """Factual, timestamped event menu for the trace — see section 3b above. Returns
     {"duration","totals","events":[{"id","t","kind",...}]} or None when the transcript
     can't be read / nothing notable happened. Every event has a stable integer `id` and a
-    code-computed `t` (MM:SS); the generator references events by id and the caller stamps t.
+    code-computed `t` (MM:SS) in ACTIVE working time (idle-capped, so a long break is not
+    counted as work); long idle gaps are surfaced as their own "downtime" events.
     Bounded for memory/cost: prompts, loops, edited files and verify runs are each capped,
-    and the JSON the model sees is char-capped in cuebench_gen.trace."""
+    and the JSON the model sees is char-capped in cuebench_gen.trace. Returns None for a falsy
+    `path` (e.g. Codex/Cursor sessions, which carry no Claude-schema transcript file)."""
+    if not path:
+        return None
     base = _parse_ts(first_ts)
     def _secs(ts_str) -> int:
         ts = _parse_ts(ts_str)
         return max(0, int((ts - base).total_seconds())) if (ts and base) else 0
 
-    prompts: list[dict] = []          # {s, text}
+    prompts: list[dict] = []          # {s, text}        (s = RAW seconds from base)
     loop_sigs: dict[str, dict] = {}   # tool+input -> {count, first_turn, last_turn, s, target}
     reads: list[dict] = []            # {s, turn, target}  (pre-first-edit reads => context build)
     edits: dict[str, dict] = {}       # basename -> {count, s, turn}
     verifies: list[dict] = []         # {s, cmd}
+    stamps: list = []                 # every record timestamp (datetime) -> active-time mapping
     model = None
     turn = 0                          # assistant tool-turn index ~= a conversational turn
     first_edit_turn = None
@@ -443,6 +490,9 @@ def build_session_events(path: str, first_ts, last_ts=None, *, max_prompts: int 
                 except Exception:
                     continue
                 rtype, ts = rec.get("type"), rec.get("timestamp")
+                tsp = _parse_ts(ts)
+                if tsp is not None:
+                    stamps.append(tsp)
                 if rtype == "user" and _is_human_prompt(rec):
                     txt = _clean_prompt(_text_from_content((rec.get("message") or {}).get("content")))
                     if txt and len(prompts) < max_prompts:
@@ -492,12 +542,38 @@ def build_session_events(path: str, first_ts, last_ts=None, *, max_prompts: int 
     except Exception:
         return None
 
+    # ---- RAW seconds -> ACTIVE seconds map (idle-capped, like active_duration) -------------
+    # A session left open across a long break must not read as continuous work, so every event
+    # time is the cumulative idle-capped elapsed time to that point. We also collect the long
+    # idle gaps to surface them as explicit "downtime" events.
+    stamps.sort()
+    raw_arr: list[float] = []         # raw seconds from base, ascending
+    act_arr: list[float] = []         # active (idle-capped) seconds at each timestamp
+    gaps: list[dict] = []             # {pause_active, idle_s} for gaps >= _TRACE_GAP_MIN_S
+    acc, prev = 0.0, None
+    for tsp in stamps:
+        rs = max(0.0, (tsp - base).total_seconds()) if base else 0.0
+        if prev is not None:
+            gap = (tsp - prev).total_seconds()
+            if gap > 0:
+                if gap >= _TRACE_GAP_MIN_S:
+                    gaps.append({"pause_active": acc, "idle_s": gap})
+                acc += min(gap, _IDLE_CAP_S)
+        raw_arr.append(rs); act_arr.append(acc)
+        prev = tsp
+    def _active(raw_s: float) -> float:
+        """Active-time position for a raw-seconds offset (nearest timestamp at/just before it)."""
+        if not act_arr:
+            return float(raw_s)
+        i = bisect.bisect_right(raw_arr, raw_s) - 1
+        return act_arr[i if i >= 0 else 0]
+
     # ---- assemble the event menu (each event gets a chronological id + MM:SS later) ----
-    raw: list[dict] = []              # carries an internal "_s" for sorting; stripped at the end
+    raw: list[dict] = []              # carries an internal "_s" (ACTIVE secs) for sorting
     if model:
-        raw.append({"_s": 0, "kind": "model", "model": model})
+        raw.append({"_s": 0.0, "kind": "model", "model": model})
     for i, p in enumerate(prompts):   # first prompt is the opener; the rest are steering turns
-        raw.append({"_s": p["s"], "kind": "open" if i == 0 else "prompt",
+        raw.append({"_s": _active(p["s"]), "kind": "open" if i == 0 else "prompt",
                     "seq": i, "text": p["text"]})
     # context build: DISTINCT files read before the first edit (or all reads if none) — only
     # notable when it's a real build (>=3 files); 1-2 reads is routine and is skipped.
@@ -507,26 +583,32 @@ def build_session_events(path: str, first_ts, last_ts=None, *, max_prompts: int 
         if r["target"] not in seen:
             seen.add(r["target"]); cfiles.append(r)
     if len(cfiles) >= 3:
-        raw.append({"_s": cfiles[0]["s"], "kind": "context",
+        raw.append({"_s": _active(cfiles[0]["s"]), "kind": "context",
                     "files": [r["target"] for r in cfiles][:14], "n_files": len(cfiles),
-                    "span": fmt_mmss(cfiles[-1]["s"] - cfiles[0]["s"])})
+                    "span": fmt_mmss(int(_active(cfiles[-1]["s"]) - _active(cfiles[0]["s"])))})
     # loops: exact-duplicate re-runs (count>=2), most-repeated first
     for ls in sorted((v for v in loop_sigs.values() if v["count"] >= 2),
                      key=lambda v: v["count"], reverse=True)[:12]:
-        raw.append({"_s": ls["s"], "kind": "loop", "target": ls["target"], "count": ls["count"],
+        raw.append({"_s": _active(ls["s"]), "kind": "loop", "target": ls["target"], "count": ls["count"],
                     "turns": (f'{ls["first_turn"]}-{ls["last_turn"]}'
                               if ls["last_turn"] > ls["first_turn"] else str(ls["first_turn"]))})
     # edits: one per file, busiest first (lets the model spot an out-of-scope file touch)
     for tgt, e in sorted(edits.items(), key=lambda kv: kv[1]["count"], reverse=True)[:12]:
-        raw.append({"_s": e["s"], "kind": "edit", "file": tgt, "edits": e["count"]})
+        raw.append({"_s": _active(e["s"]), "kind": "edit", "file": tgt, "edits": e["count"]})
     for v in verifies[:8]:
-        raw.append({"_s": v["s"], "kind": "verify", "cmd": v["cmd"]})
+        raw.append({"_s": _active(v["s"]), "kind": "verify", "cmd": v["cmd"]})
+    # downtime: long idle gaps, largest first. _s = pause point + 0.5 so it sorts right AFTER
+    # the last pre-break event and before the resumed work. idle_s lets the generator guarantee
+    # a big gap (>= _TRACE_GAP_BIG_S) is never dropped from the 4-8 entries.
+    for g in sorted(gaps, key=lambda x: x["idle_s"], reverse=True)[:6]:
+        raw.append({"_s": g["pause_active"] + 0.5, "kind": "downtime",
+                    "idle": fmt_duration(int(g["idle_s"])), "idle_s": int(g["idle_s"])})
 
     # nothing notable beyond a bare model/close anchor -> no trace
     if not (prompts or loop_sigs or edits or verifies or cfiles):
         return None
 
-    dur_s = _secs(last_ts) if last_ts else max((e["_s"] for e in raw), default=0)
+    dur_s = act_arr[-1] if act_arr else 0.0      # ACTIVE total (matches the dashboard duration)
     raw.append({"_s": dur_s, "kind": "close", "ended_on": last_actor or "agent",
                 "verify_after_last_edit": verify_after_last_edit,
                 "edits_total": sum(e["count"] for e in edits.values())})
@@ -535,13 +617,14 @@ def build_session_events(path: str, first_ts, last_ts=None, *, max_prompts: int 
     events = []
     for i, e in enumerate(raw):
         ev = {k: v for k, v in e.items() if k != "_s"}
-        ev = {"id": i, "t": fmt_mmss(e["_s"]), **ev}
+        ev = {"id": i, "t": fmt_mmss(int(e["_s"])), **ev}
         events.append(ev)
     return {
-        "duration": fmt_mmss(dur_s),
+        "duration": fmt_mmss(int(dur_s)),
         "totals": {"prompts": len(prompts), "files_edited": len(edits),
                    "edits": sum(e["count"] for e in edits.values()),
-                   "loops": sum(v["count"] - 1 for v in loop_sigs.values() if v["count"] > 1)},
+                   "loops": sum(v["count"] - 1 for v in loop_sigs.values() if v["count"] > 1),
+                   "idle_gaps": len(gaps)},
         "events": events,
     }
 
@@ -590,6 +673,11 @@ def build_payload(parsed: dict, scorer: ModelScorer, store: Store, gen: Generato
                               parsed["n_edits"], parsed["loops"], parsed["churn"], git)
     digest = sig.digest_text(inputs)
     vectors = scorer.score(digest)               # {axis: 0-100}
+    # Length-bias correction (v1): the model over-amplifies session length (Spearman ~+0.78 vs
+    # the judge's ~+0.37), inflating discernment/diligence on long sessions. Pull that excess
+    # out so a long flailing session can score low. Centered -> avg session unchanged. See
+    # cuebench_calibrate. (Stopgap until the model is retrained with rate-based features.)
+    vectors = calib.decorrelate(vectors, sig.n_effective(inputs))
     raw_composite = sum(vectors.values()) / 4.0
     score = round(raw_composite)
     # Headline verdict: confidence gate first (thin -> "Insufficient signal"), else a zone.
@@ -629,8 +717,14 @@ def build_payload(parsed: dict, scorer: ModelScorer, store: Store, gen: Generato
         # tool loops + turn ranges, context build, edits, verify runs, model, close) feeds BOTH
         # content-aware paths, so build it ONCE when either is on. Trace labels events by id;
         # grounded insights cite them to name a real file/turn/message/outcome.
-        events = (build_session_events(parsed["path"], parsed["first_ts"], parsed["last_ts"])
-                  if (gen.trace_enabled or gen.insights_prompts_enabled) else None)
+        # NOTE: the menu RE-PARSES the raw transcript in Claude Code's JSONL schema, so it only
+        # applies to sessions that carry such a file ("path"). Codex rollouts / Cursor composers
+        # parse to a Claude-SHAPED signal dict but have no Claude-schema file here, so events stays
+        # None for them (trace omitted, grounded insights fall back to prompts) — and crucially the
+        # POST still proceeds. Missing "path" must NOT raise: that KeyError used to sink the POST.
+        gen_path = parsed.get("path")
+        events = (build_session_events(gen_path, parsed["first_ts"], parsed["last_ts"])
+                  if (gen_path and (gen.trace_enabled or gen.insights_prompts_enabled)) else None)
         # insights are numbers-only UNLESS grounded mode is on (CUEBENCH_INSIGHTS_PROMPTS): then
         # gen.insights feeds the operator's prompts AND the event menu to its own BYOK endpoint so
         # coaching can name what actually happened. The flag is checked inside insights(); passing
@@ -640,7 +734,10 @@ def build_payload(parsed: dict, scorer: ModelScorer, store: Store, gen: Generato
         # Trace: the model labels the notable events and references each by its integer id; the
         # TIME on every entry is code-computed here and stamped by the generator from that id —
         # the AI never sees or authors a timestamp, and can only point at an event we extracted.
-        trace = gen.trace(events) if gen.trace_enabled else None
+        # vectors/quality are passed so the trace's good/warn signals stay COHERENT with the
+        # authoritative axis scores (a strong delegation/description score can't show a 'warn'
+        # opening) and with the headline verdict — same coherence insights already gets.
+        trace = gen.trace(events, vectors=vectors, quality=quality) if gen.trace_enabled else None
         # Provider reachable iff a BYOK product came back -> persist (paid once). specificity is
         # local now, so it does NOT signal reachability; gate only on the BYOK outputs.
         if insights is not None or trace is not None:
