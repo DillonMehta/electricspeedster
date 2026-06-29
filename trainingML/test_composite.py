@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-test_composite.py — the WEIGHTED headline composite (cuebench_signals.composite) and the
+test_composite.py — the headline composite (cuebench_signals.composite) and the
 Description/specificity blend (cuebench_signals.blend_description).
 
-The score is a weighted mean of the four axes (outcome-heavy: discernment + diligence carry
-0.30 each, delegation + description 0.20 each), not an even average.
+The score is the mean of the four axes; weights are currently EVEN (all 0.25).
 
 Run:  python3 -m pytest test_composite.py -q
 """
@@ -13,29 +12,15 @@ import cuebench_signals as sig
 
 
 def test_weights_match_chosen_scheme():
-    assert sig.AXIS_WEIGHTS == {"delegation": 0.20, "description": 0.20,
-                                "discernment": 0.30, "diligence": 0.30}
+    assert sig.AXIS_WEIGHTS == {"delegation": 0.25, "description": 0.25,
+                                "discernment": 0.25, "diligence": 0.25}
 
 
-def test_weighted_mean_value():
+def test_even_weights_equal_plain_mean():
     v = {"delegation": 80, "description": 80, "discernment": 50, "diligence": 50}
-    # 0.2*80 + 0.2*80 + 0.3*50 + 0.3*50 = 32 + 30 = 62  (even mean would be 65)
-    assert abs(sig.composite(v) - 62.0) < 1e-6
-
-
-def test_outcome_strength_beats_even_average():
-    """A session strong on the outcome axes (discernment/diligence) but weak on the input
-    axes scores HIGHER than an even average — that's the point of the reweighting."""
-    v = {"delegation": 40, "description": 40, "discernment": 90, "diligence": 90}
-    even = sum(v.values()) / 4.0
-    assert sig.composite(v) > even          # 70 vs 65
-
-
-def test_outcome_weakness_costs_more():
-    """Weakness on the HEAVIER outcome axes drags the score down more than an even mean would."""
-    v = {"delegation": 70, "description": 70, "discernment": 70, "diligence": 30}
-    # weighted = 0.2*70+0.2*70+0.3*70+0.3*30 = 14+14+21+9 = 58 ; even = 60
-    assert abs(sig.composite(v) - 58.0) < 1e-6
+    assert abs(sig.composite(v) - 65.0) < 1e-6        # even weights -> plain average
+    v2 = {"delegation": 70, "description": 60, "discernment": 90, "diligence": 40}
+    assert abs(sig.composite(v2) - sum(v2.values()) / 4.0) < 1e-6
 
 
 def test_blend_description_60_40():

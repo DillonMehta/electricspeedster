@@ -162,17 +162,17 @@ def digest_text(inputs: dict, max_prompt_chars: int = 4000) -> str:
     return head + "\nPROMPTS:" + "".join(prompts)
 
 # ============================================================================
-# 4b. COMPOSITE  — the headline 0-100 score is a WEIGHTED mean of the four axes,
-#     NOT an even average. Diligence + discernment (did they VERIFY and use sound
-#     JUDGMENT — the outcome axes) carry more than delegation + description (the
-#     input axes). Single source of truth — build_payload and the zone calibrator
-#     both call composite() so the score and its calibration never diverge.
+# 4b. COMPOSITE  — the headline 0-100 score is the mean of the four axes. Weights
+#     are currently EVEN (all 0.25): every axis counts the same. composite() is the
+#     single source of truth — build_payload and the zone calibrator both call it,
+#     so the score and its calibration never diverge. (To re-weight, edit the dict
+#     and rerun cuebench_calibrate_zones.py; weights renormalize over present axes.)
 # ============================================================================
 AXIS_WEIGHTS = {                   # relative weights; normalized over present axes in composite()
-    "delegation": 0.20,
-    "description": 0.20,
-    "discernment": 0.30,
-    "diligence": 0.30,
+    "delegation": 0.25,
+    "description": 0.25,
+    "discernment": 0.25,
+    "diligence": 0.25,
 }
 
 def composite(vectors: dict) -> float:
@@ -284,21 +284,21 @@ THIN_SESSION_MIN_SUPPORT = 11      # support (prompts+tools) below this -> Insuf
 # WEIGHTED composite (sig.composite, driving-skill heavier) AFTER the length-bias correction
 # (cuebench_calibrate) — both shift/compress the distribution, so the even-average v1 bounds
 # no longer fit. Re-run the calibrator whenever the weights, calibration, or model change.
-EB_PRIOR_MEAN     = 50.0           # mean composite under outcome-heavy weights + desc/spec blend
+EB_PRIOR_MEAN     = 51.6           # mean composite under EVEN weights + desc/spec blend + recenter
 EB_PRIOR_STRENGTH = 11.0           # K: pseudo-observations of prior weight. support>>K -> ~raw;
                                    # support==K -> halfway to prior. Tied to the gate by design.
 
 # Lower bounds (on the EB-shrunk, rounded composite) separating the 6 zones.
 # Ascending; a score in [MAX_below, MAX_at) lands in the zone named by the upper const.
-# Recalibrated for the outcome-heavy weights (diligence/discernment 0.30) + the description/
-# specificity blend + the -6 recentering — that distribution centers ~50, so the bounds dropped
-# accordingly (a "Dialed in" session now reads ~60+, not ~80). Urgent tier ~10.1% of substantive.
-ZONE_CRITICAL_MAX         = 31     # eb_score <  31            -> 6 Critical        (URGENT)
-ZONE_NEEDS_ATTENTION_MAX  = 38     # 31 <= eb_score < 38       -> 5 Needs attention (URGENT)
-ZONE_INCONSISTENT_MAX     = 46     # 38 <= eb_score < 46       -> 4 Inconsistent
-ZONE_DEVELOPING_MAX       = 52     # 46 <= eb_score < 52       -> 3 Developing
-ZONE_SOLID_MAX            = 60     # 52 <= eb_score < 60       -> 2 Solid
-#                                    eb_score >= 60            -> 1 Dialed in
+# Recalibrated for EVEN axis weights (all 0.25) + the description/specificity blend + the -6
+# recentering — that distribution centers ~51.6, so a "Dialed in" session reads ~61+. Urgent
+# tier ~10.4% of substantive. (Rerun cuebench_calibrate_zones.py if any scoring step changes.)
+ZONE_CRITICAL_MAX         = 33     # eb_score <  33            -> 6 Critical        (URGENT)
+ZONE_NEEDS_ATTENTION_MAX  = 41     # 33 <= eb_score < 41       -> 5 Needs attention (URGENT)
+ZONE_INCONSISTENT_MAX     = 49     # 41 <= eb_score < 49       -> 4 Inconsistent
+ZONE_DEVELOPING_MAX       = 54     # 49 <= eb_score < 54       -> 3 Developing
+ZONE_SOLID_MAX            = 61     # 54 <= eb_score < 61       -> 2 Solid
+#                                    eb_score >= 61            -> 1 Dialed in
 
 INSUFFICIENT_SIGNAL = "Insufficient signal"   # the gated state's label (NOT a zone)
 
