@@ -85,26 +85,50 @@ def test_parse_cursor_maps_to_claude_shape(tmp_path):
         "duration_s", "cwd", "git_branch", "n_lines"}
 
 
-def test_scan_cursor_stability_and_dedup(monkeypatch):
-    """Composer is processed only after its lastUpdatedAt is stable, and exactly once."""
+def _fake_agent():
     calls = []
 
     class FakeAgent:
-        STABLE_SECONDS = 0
         def process_parsed(self, parsed, scorer, store, gen, *, dry_run, source):
             calls.append(source)
             return ("posted", "S-X")
+    return FakeAgent(), calls
 
+
+def test_scan_cursor_stability_and_dedup(monkeypatch, tmp_path):
+    """Cursor is read only after the DB mtime settles for stable_seconds, then scored once.
+    (mtime-gating means the daemon reads Cursor's TCC-gated folder ~once per finished session,
+    not once per poll — so macOS doesn't re-prompt every cycle.)"""
     monkeypatch.setattr(cur, "list_cursor_composers",
                         lambda db=None: [{"composer_id": "c1", "name": "n",
-                                          "status": "completed", "last_updated": 5, "n_bubbles": 3}])
+                                          "last_updated": 5, "n_bubbles": 3}])
     monkeypatch.setattr(cur, "parse_cursor_composer",
                         lambda cid, db=None: {"session_uuid": cid, "prompts": ["x"]})
-    st = {"seen": {}, "handled": set()}
-    fa = FakeAgent()
-    daemon.scan_cursor_once(fa, None, None, None, dry_run=True, state=st, stable_seconds=0)
-    assert calls == []                              # first sight → start stability clock
-    daemon.scan_cursor_once(fa, None, None, None, dry_run=True, state=st, stable_seconds=0)
-    assert calls == ["cursor:c1"]                   # stable → processed once
-    daemon.scan_cursor_once(fa, None, None, None, dry_run=True, state=st, stable_seconds=0)
-    assert calls == ["cursor:c1"]                   # already handled → not re-processed
+    db = tmp_path / "state.vscdb"
+    db.write_bytes(b"x" * 32)
+    db = str(db)
+    st, (fa, calls) = {}, _fake_agent()
+    daemon.scan_cursor_once(fa, None, None, None, dry_run=True, state=st, stable_seconds=0, db=db)
+    assert calls == []                              # first sight of this mtime → start the clock
+    daemon.scan_cursor_once(fa, None, None, None, dry_run=True, state=st, stable_seconds=0, db=db)
+    assert calls == ["cursor:c1"]                   # mtime settled → read + scored once
+    daemon.scan_cursor_once(fa, None, None, None, dry_run=True, state=st, stable_seconds=0, db=db)
+    assert calls == ["cursor:c1"]                   # same stable mtime → not re-scored
+
+
+def test_scan_cursor_disables_on_denied_access(monkeypatch, tmp_path):
+    """A macOS PermissionError disables Cursor scanning for the run — so the daemon stops
+    re-prompting every poll instead of nagging the user indefinitely."""
+    def boom(*a, **k):
+        raise PermissionError("Operation not permitted")
+    monkeypatch.setattr(cur, "list_cursor_composers", boom)
+    db = tmp_path / "state.vscdb"
+    db.write_bytes(b"x" * 32)
+    db = str(db)
+    st, (fa, calls) = {}, _fake_agent()
+    daemon.scan_cursor_once(fa, None, None, None, dry_run=True, state=st, stable_seconds=0, db=db)
+    daemon.scan_cursor_once(fa, None, None, None, dry_run=True, state=st, stable_seconds=0, db=db)
+    assert st["disabled"] is True                   # denial → scanning turned off
+    assert calls == []
+    daemon.scan_cursor_once(fa, None, None, None, dry_run=True, state=st, stable_seconds=0, db=db)
+    assert st["disabled"] is True                   # stays off; no further read attempts

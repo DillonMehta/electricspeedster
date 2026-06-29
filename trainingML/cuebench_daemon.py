@@ -274,49 +274,88 @@ def read_status() -> dict | None:
         return None
 
 
-def scan_cursor_once(agent, scorer, store, gen, *, dry_run, state, stable_seconds):
-    """Scan Cursor composers once and score/POST the finished, changed ones. Cursor isn't a
-    file source, so we mirror the file watcher's stable-detection on `lastUpdatedAt`: a composer
-    is processed only after its timestamp has been unchanged for `stable_seconds` (so we never
-    score one mid-run), once per stable point. Dedup/append/POST are handled by
-    agent.process_parsed (keyed on the stable sessionId), exactly like Claude/Codex files.
+def scan_cursor_once(agent, scorer, store, gen, *, dry_run, state, stable_seconds, db=None):
+    """Scan Cursor composers once and score/POST the finished, changed ones. Cursor isn't a file
+    source, so finished-ness is detected on the DB's mtime: once Cursor stops writing for
+    `stable_seconds`, the (now-settled) composers are read and scored once. Dedup/append/POST are
+    handled by agent.process_parsed (keyed on the stable sessionId), like Claude/Codex files.
 
-    state = {"seen": {cid: (last_updated, first_seen_at)}, "handled": set(cid)}.
+    state = {"disabled":bool, "mtime":float, "mtime_at":float, "done_mtime":float,
+             "handled": {cid: last_updated}}.  `db` overrides the DB path (tests).
     """
+    if state.get("disabled"):
+        return
     try:
         import cuebench_cursor as cur
-        import time as _t
     except Exception:
         return
-    now = _t.time()
+    path = db or cur._db_path()
+    now = time.time()
+
+    # TCC/privacy gate: macOS gates the (launchd-spawned) daemon's reads of Cursor's app-data
+    # folder behind a prompt that doesn't reliably persist. To avoid nagging every poll, we only
+    # OPEN the DB once Cursor has finished writing — its mtime has CHANGED and then held steady
+    # for stable_seconds — so a finished session reads ~once, not once per 20s poll. (Grant Full
+    # Disk Access to the daemon's Python for silent, persistent access.)
     try:
-        comps = cur.list_cursor_composers()
-    except Exception:
+        mtime = os.stat(path).st_mtime
+    except FileNotFoundError:
         return
+    except (PermissionError, OSError) as e:
+        _disable_cursor(state, e)
+        return
+    if mtime != state.get("mtime"):               # Cursor just wrote -> (re)start stability clock
+        state["mtime"], state["mtime_at"] = mtime, now
+        return
+    if now - state.get("mtime_at", now) < stable_seconds:   # still settling
+        return
+    if state.get("done_mtime") == mtime:          # already scored this stable point
+        return
+
+    try:
+        comps = cur.list_cursor_composers(path)
+        if not comps:                             # list swallows errors -> probe to tell denied vs empty
+            with open(path, "rb") as fh:
+                fh.read(16)
+    except FileNotFoundError:
+        return
+    except (PermissionError, OSError) as e:       # macOS denied access -> stop asking, guide the user
+        _disable_cursor(state, e)
+        return
+    state["done_mtime"] = mtime
+    handled = state.setdefault("handled", {})      # cid -> last_updated we scored (append re-opens)
     for comp in comps:
         cid = comp.get("composer_id")
         lu = comp.get("last_updated") or 0
-        if not cid or (comp.get("n_bubbles") or 0) <= 0:
-            continue
-        prev = state["seen"].get(cid)
-        if prev is None or prev[0] != lu:
-            state["seen"][cid] = (lu, now)        # new/changed -> reset the stability clock
-            state["handled"].discard(cid)         # growth re-opens it (append -> UPDATE)
-            continue
-        if now - prev[1] < stable_seconds or cid in state["handled"]:
+        if not cid or (comp.get("n_bubbles") or 0) <= 0 or handled.get(cid) == lu:
             continue
         print(f"[finished] cursor:{comp.get('name') or cid}", flush=True)
         try:
-            parsed = cur.parse_cursor_composer(cid)
+            parsed = cur.parse_cursor_composer(cid, path)
             status, _ = agent.process_parsed(parsed, scorer, store, gen, dry_run=dry_run,
                                              source=f"cursor:{cid[:8]}")
+        except (PermissionError, OSError) as e:
+            _disable_cursor(state, e)
+            return
         except Exception as e:
             print(f"  [error] cursor {cid}: {e!r}", file=sys.stderr, flush=True)
-            status = "skip"
+            continue
         if status in ("posted", "dup", "skip"):
-            state["handled"].add(cid)
-        else:
-            state["seen"][cid] = (lu, now)        # transient POST failure -> retry next pass
+            handled[cid] = lu                     # remember the version scored; growth re-scores
+
+
+def _disable_cursor(state, err=None):
+    """macOS denied the daemon access to Cursor's data: disable Cursor scanning for the rest of
+    this run (don't re-prompt every poll) and tell the user exactly how to enable it for good."""
+    state["disabled"] = True
+    print("[cursor] macOS denied access to Cursor's data; Cursor scanning is OFF for this run"
+          + (f" ({err})" if err else "") + ".\n"
+          "         To score Cursor sessions, grant Full Disk Access to the daemon's Python:\n"
+          "           System Settings > Privacy & Security > Full Disk Access > '+'\n"
+          "           (Cmd-Shift-G) /opt/anaconda3/bin/python  -> enable -> "
+          "python cuebench_daemon.py restart\n"
+          "         Or disable Cursor entirely: launchctl setenv CUEBENCH_CURSOR 0 (then restart).",
+          file=sys.stderr, flush=True)
 
 
 # ============================================================================
@@ -379,7 +418,11 @@ def cmd_run(args) -> int:
             cursor_db = _cc.DEFAULT_CURSOR_DB
         except Exception:
             cursor_db = ""
-    cursor_on = bool(cursor_db and os.path.exists(cursor_db))
+    # Kill-switch: CUEBENCH_CURSOR=0 disables Cursor scanning entirely (e.g. to silence the
+    # macOS Full-Disk-Access prompt if the user would rather not grant it).
+    cursor_enabled = os.environ.get("CUEBENCH_CURSOR", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+    cursor_on = bool(cursor_enabled and cursor_db and os.path.exists(cursor_db))
     watching = "; ".join(roots) + ("  + Cursor" if cursor_on else "")
     print(f"[daemon] starting  mode={mode}  pid={os.getpid()}  "
           f"time={time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
@@ -424,14 +467,14 @@ def cmd_run(args) -> int:
     # Heartbeat closure: bump a cycle counter, write status, and (since Cursor isn't a file
     # source) scan Cursor composers each scan pass.
     state = {"cycles": 0}
-    cursor_state = {"seen": {}, "handled": set()}
+    cursor_state = {}
 
     def _heartbeat():
         state["cycles"] += 1
         write_status(mode, state["cycles"], agent.POLL_INTERVAL, watching, processed=0)
         if cursor_on:
-            scan_cursor_once(agent, scorer, store, gen, dry_run=dry_run,
-                             state=cursor_state, stable_seconds=agent.STABLE_SECONDS)
+            scan_cursor_once(agent, scorer, store, gen, dry_run=dry_run, state=cursor_state,
+                             stable_seconds=agent.STABLE_SECONDS, db=cursor_db)
 
     write_status(mode, 0, agent.POLL_INTERVAL, watching, processed=0)
     # Reuse the EXACT existing loop (stable-size detection, dedup, retry-later) — only the
