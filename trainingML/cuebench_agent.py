@@ -677,7 +677,8 @@ def build_payload(parsed: dict, scorer: ModelScorer, store: Store, gen: Generato
     # the judge's ~+0.37), inflating discernment/diligence on long sessions. Pull that excess
     # out so a long flailing session can score low. Centered -> avg session unchanged. See
     # cuebench_calibrate. (Stopgap until the model is retrained with rate-based features.)
-    vectors = calib.decorrelate(vectors, sig.n_effective(inputs))
+    vectors = calib.decorrelate(vectors, sig.n_effective(inputs))   # length-bias correction
+    vectors = calib.recenter(vectors)            # global -6 level recentering (judge runs generous)
     raw_composite = sig.composite(vectors)       # WEIGHTED mean (driving-skill heavier), not even
     score = round(raw_composite)
     # Headline verdict: confidence gate first (thin -> "Insufficient signal"), else a zone.

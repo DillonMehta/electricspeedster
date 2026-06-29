@@ -42,6 +42,14 @@ BETA = {                                      # model's prediction slope vs cent
 C = 0.65                                      # decorrelation strength: composite Spearman(support) ~+0.18
 TARGET_SPEARMAN = 0.18                         # documented intent for this C
 
+# Global level recentering (separate from the length correction above). The local model
+# faithfully reproduces the gpt-5.5 judge, which grades ~6 points more generously than the
+# operator's bar — so EVERY axis is shifted down by this amount (vectors AND composite drop ~6).
+# This is the post-hoc equivalent of retraining on down-shifted labels; fold it into the labels
+# at the next retrain. Tunable: change LEVEL_OFFSET and keep the zone cutoffs to grade harder/
+# softer (EB_PRIOR_MEAN in cuebench_signals is kept in step with it). 0.0 = no recentering.
+LEVEL_OFFSET = -6.0
+
 # Clamp the centering term so a pathologically short/long session can't get an extreme swing.
 # Range covers ~support 5 (Lc≈-2.2) to ~support 3700 (Lc≈+4.2) seen in the corpus.
 _LC_MIN, _LC_MAX = -2.2, 4.3
@@ -52,11 +60,23 @@ def decorrelate(vectors: dict, support: int) -> dict:
 
     Returns a NEW dict of ints in [0,100]. `support` is prompts + tool calls
     (cuebench_signals.n_effective). Unknown axes (not in BETA) pass through unchanged.
-    The transform is centered, so a session at the corpus-mean length is unchanged."""
+    The transform is centered, so a session at the corpus-mean length is unchanged.
+    Length only — the global level offset is applied separately by recenter()."""
     lc = math.log1p(max(0, int(support or 0))) - L0
     lc = max(_LC_MIN, min(_LC_MAX, lc))
     out = {}
     for ax, v in vectors.items():
         adj = C * BETA.get(ax, 0.0) * lc
         out[ax] = int(round(min(100.0, max(0.0, float(v) - adj))))
+    return out
+
+
+def recenter(vectors: dict) -> dict:
+    """Apply the global LEVEL_OFFSET to the real axes (clipped to [0,100]). Kept separate from
+    decorrelate() so the length and level calibrations stay independent and individually tunable.
+    Unknown axes (not in BETA) pass through unchanged."""
+    out = {}
+    for ax, v in vectors.items():
+        shift = LEVEL_OFFSET if ax in BETA else 0.0
+        out[ax] = int(round(min(100.0, max(0.0, float(v) + shift))))
     return out

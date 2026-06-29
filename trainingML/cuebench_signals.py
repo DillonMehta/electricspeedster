@@ -269,7 +269,7 @@ THIN_SESSION_MIN_SUPPORT = 11      # support (prompts+tools) below this -> Insuf
 # WEIGHTED composite (sig.composite, driving-skill heavier) AFTER the length-bias correction
 # (cuebench_calibrate) — both shift/compress the distribution, so the even-average v1 bounds
 # no longer fit. Re-run the calibrator whenever the weights, calibration, or model change.
-EB_PRIOR_MEAN     = 59.4           # mean weighted+calibrated composite over substantive sessions
+EB_PRIOR_MEAN     = 53.4           # mean weighted+calibrated composite (incl. -6 recentering)
 EB_PRIOR_STRENGTH = 11.0           # K: pseudo-observations of prior weight. support>>K -> ~raw;
                                    # support==K -> halfway to prior. Tied to the gate by design.
 

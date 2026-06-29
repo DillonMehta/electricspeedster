@@ -104,8 +104,9 @@ def main():
             if sup is None:
                 continue
             vectors = scorer.score(text)
-            vectors = calib.decorrelate(vectors, sup)   # mirror production: calibrate, then
-            raw = sig.composite(vectors)                # WEIGHTED composite (not even mean)
+            vectors = calib.decorrelate(vectors, sup)   # mirror production: length-correct,
+            vectors = calib.recenter(vectors)           # global level recenter,
+            raw = sig.composite(vectors)                # then WEIGHTED composite (not even mean)
             rows.append((rec.get("sid", ""), sup, raw))
             n_seen += 1
             if n_seen % 500 == 0:

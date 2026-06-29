@@ -54,6 +54,19 @@ def test_unknown_axis_passes_through():
     assert out["mystery"] == 42
 
 
+def test_recenter_applies_global_offset():
+    v = {"delegation": 70, "description": 70, "discernment": 70, "diligence": 70}
+    out = calib.recenter(v)
+    for ax in v:
+        assert out[ax] == round(70 + calib.LEVEL_OFFSET)   # every real axis shifted by the offset
+
+
+def test_recenter_clips_and_skips_unknown_axes():
+    assert calib.recenter({"delegation": 3})["delegation"] >= 0      # clip low
+    assert calib.recenter({"diligence": 100})["diligence"] <= 100    # clip high
+    assert calib.recenter({"mystery": 42})["mystery"] == 42          # unknown axis untouched
+
+
 def test_returns_ints():
     out = calib.decorrelate({"delegation": 70, "diligence": 60}, 300)
     assert all(isinstance(x, int) for x in out.values())
