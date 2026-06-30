@@ -153,6 +153,33 @@ def recent_sessions(limit: int = 6) -> list[dict]:
     return rows
 
 
+def tail_text(path: str, max_bytes: int = 200_000, max_lines: int = 2000) -> str:
+    """Trailing slice of a (possibly huge) log file for the in-app terminal-style viewer.
+
+    Reads only the last `max_bytes` and keeps the last `max_lines` lines, so opening a multi-MB
+    daemon log is instant and the NEWEST line is what lands at the bottom. Prefixes a one-line
+    notice when the log was truncated, so it's obvious there's more history above."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(-max_bytes, os.SEEK_END)
+            data = f.read()
+    except OSError:
+        return ""
+    text = data.decode("utf-8", errors="replace")
+    if size > max_bytes:
+        text = text.split("\n", 1)[-1]          # drop the partial first line left by the seek
+    lines = text.splitlines()
+    truncated = size > max_bytes or len(lines) > max_lines
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    body = "\n".join(lines)
+    if truncated:
+        body = f"… showing the last {len(lines)} lines — full log: {path} …\n\n" + body
+    return body
+
+
 def read_settings() -> dict:
     """Current values of the managed settings (for prefilling the Settings pane)."""
     env = d.parse_env_file(d.ENVFILE)   # resolve path at call time (don't bind the default)
@@ -715,17 +742,6 @@ def run_menubar():
                     size=11, color=ter))
 
             self._sep()
-            self._add("", enabled=False, attr=self._attr(
-                "RECENT SESSIONS  ·  HOVER ▸ FOR DETAIL", size=10, color=ter, kern=0.5))
-            rows = recent_sessions(6)
-            if not rows:
-                self._add("", enabled=False, indent=1, attr=self._attr(
-                    "None yet — scores appear as sessions finish", size=12, color=ter))
-            else:
-                for r in rows:
-                    self._add_session_item(r)
-
-            self._sep()
             if st["running"]:
                 self._add("Stop", "doStop:")
             elif st["installed"]:
@@ -752,6 +768,8 @@ def run_menubar():
             self._add("Test POST to dashboard (debug)…", "doDebugPost:", indent=1)
             self._add("Clear sent cache (resend sessions)…", "doClearCache:", indent=1)
             self._add("Regenerate insights + trace (resend)…", "doRegenerate:", indent=1)
+            agg = self._add("Aggressive mode — finish sessions fast", "doToggleAggressive:", indent=1)
+            agg.setState_(1 if _env_truthy(read_settings().get("CUEBENCH_AGGRESSIVE")) else 0)
             self._add("Open config file…", "doOpenConfig:", indent=1)
 
             self._sep()
@@ -833,9 +851,40 @@ def run_menubar():
                 self._alert("Login-item change failed", repr(e))
             self.rebuild()
 
+        def doToggleAggressive_(self, _s):
+            # Speed mode: flip CUEBENCH_AGGRESSIVE in daemon.env (preserving the other managed keys)
+            # and restart so the daemon re-reads it. ON => ~8s stable / 3s poll (sessions post in ~10s).
+            cur = read_settings()                       # all managed keys at their current values
+            on = not _env_truthy(cur.get("CUEBENCH_AGGRESSIVE"))
+            cur["CUEBENCH_AGGRESSIVE"] = "1" if on else ""
+            try:
+                d.save_env_file(cur)
+            except Exception as e:
+                self._alert("Could not save aggressive mode", repr(e)); return
+            restarted = False
+            if d.status_dict().get("installed"):
+                svc = self._svc()
+                if svc:
+                    try: svc.restart(); restarted = True
+                    except Exception: pass
+            self._alert("Aggressive mode " + ("ON" if on else "OFF"),
+                        (("Finish-detection tightened to ~8s stable / 3s poll — a finished session "
+                          "now posts in ~10s instead of ~80s. ") if on else
+                         "Back to the default ~60s stable / 20s poll. ")
+                        + ("Daemon restarted with the new setting." if restarted
+                           else "Start the daemon to apply it."))
+            self.rebuild()
+
         def doOpenLogs_(self, _s):
-            target = d.OUT_LOG if os.path.exists(d.OUT_LOG) else d.LOG_DIR
-            subprocess.run(["/usr/bin/open", target])
+            # Terminal-style in-app viewer: show the TAIL of the daemon log scrolled to the
+            # bottom (newest line visible) instead of opening a multi-MB file at the top, where
+            # you'd have to scroll all the way down to find the latest activity.
+            body = tail_text(d.OUT_LOG)
+            if not body:
+                subprocess.run(["/usr/bin/open", d.LOG_DIR])   # nothing logged yet -> reveal dir
+                return
+            self._open_text_viewer("CueBench — daemon log (newest at bottom)", body,
+                                   scroll_to_end=True, track_preview=False)
 
         def doRefresh_(self, _s):
             self.rebuild()
@@ -870,11 +919,12 @@ def run_menubar():
             threading.Thread(target=self._gen_preview, args=(path,), daemon=True).start()
 
         @objc.python_method
-        def _open_text_viewer(self, title, text):
+        def _open_text_viewer(self, title, text, scroll_to_end=False, track_preview=True):
             from AppKit import (NSWindow, NSScrollView, NSTextView, NSFont,
                                 NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
                                 NSWindowStyleMaskResizable, NSBackingStoreBuffered,
                                 NSViewWidthSizable, NSViewHeightSizable)
+            from Foundation import NSMakeRange
             rect = NSMakeRect(0, 0, 660, 580)
             win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
                 rect,
@@ -895,7 +945,10 @@ def run_menubar():
             win.center()
             NSApp.activateIgnoringOtherApps_(True)
             win.makeKeyAndOrderFront_(None)
-            self._preview_win, self._preview_tv = win, tv
+            if scroll_to_end:                      # terminal-style: land on the newest line
+                tv.scrollRangeToVisible_(NSMakeRange(tv.string().length(), 0))
+            if track_preview:                      # only the payload preview fills in async later
+                self._preview_win, self._preview_tv = win, tv
             if not hasattr(self, "_viewers"):
                 self._viewers = []
             self._viewers.append(win)              # retain so it isn't GC'd
@@ -1029,7 +1082,9 @@ def run_menubar():
                 self.settingsWindow = None
 
         def doSaveSettings_(self, _s):
-            updates = {}
+            # Seed with the current managed values so keys NOT shown in this form (e.g.
+            # CUEBENCH_AGGRESSIVE, toggled from the DEVELOPER menu) are preserved, not wiped.
+            updates = read_settings()
             for k in self.fields:
                 kind = self.field_kinds.get(k)
                 if kind == "choice":
